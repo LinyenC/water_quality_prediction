@@ -1,0 +1,142 @@
+project:
+  name: hydrotail_gmt
+
+paths:
+  dynamic_data: data/dynamic_daily.csv
+  static_data: data/static_attributes.csv
+  output_dir: outputs/default_run
+
+data:
+  station_col: station_id
+  date_col: date
+  time_frequency: D
+  targets:
+    conductance: specific_conductance
+    turbidity: turbidity
+  dynamic_features:
+    - discharge
+    - precip
+    - air_temp
+  static_features:
+    - latitude
+    - longitude
+    - watershed_area
+    - slope
+    - impervious_ratio
+    - ksat
+    - aridity_index
+
+features:
+  horizons:
+    - 1
+  lags:
+    - 1
+    - 3
+    - 7
+    - 14
+    - 30
+  rolling_windows:
+    - 3
+    - 7
+    - 14
+    - 30
+  add_seasonal: true
+  min_non_null_feature_ratio: 0.25
+
+sequence:
+  lookback_window: 30
+  min_history_ratio: 0.15
+
+graph:
+  enabled: true
+  k_neighbors: 5
+  feature_columns:
+    - slope
+    - impervious_ratio
+    - ksat
+    - aridity_index
+    - watershed_area
+
+splits:
+  strategy: unseen_station_and_future
+  seed: 42
+  train_station_fraction: 0.7
+  valid_station_fraction: 0.15
+  test_station_fraction: 0.15
+  train_time_fraction: 0.7
+  valid_time_fraction: 0.15
+
+tail:
+  exceedance_quantiles:
+    conductance: 0.95
+    turbidity: 0.9
+  quantiles:
+    - 0.1
+    - 0.5
+    - 0.9
+    - 0.95
+    - 0.99
+  quantile_weights:
+    - 1.0
+    - 1.0
+    - 1.5
+    - 2.0
+    - 2.5
+  tail_weight_multiplier: 4.0
+
+run:
+  models:
+    - linear_tail
+    - gbdt_tail
+    - torch_tail
+    # Optional sequence models:
+    # - seq_tcn_tail
+    # - seq_transformer_tail
+
+models:
+  linear_tail:
+    alpha: 0.01
+    max_iter: 2000
+  gbdt_tail:
+    n_estimators: 300
+    max_depth: 3
+    learning_rate: 0.05
+    min_samples_leaf: 20
+  torch_tail:
+    graph_backend: neighbor_stats
+    hidden_dims:
+      - 128
+      - 64
+    dropout: 0.1
+    batch_size: 256
+    epochs: 25
+    patience: 5
+    learning_rate: 0.001
+    weight_decay: 0.0001
+    gnn:
+      hidden_dim: 64
+      num_layers: 2
+      dropout: 0.1
+  seq_tcn_tail:
+    hidden_dim: 64
+    tcn_channels:
+      - 64
+      - 64
+    kernel_size: 3
+    dropout: 0.1
+    batch_size: 128
+    epochs: 20
+    patience: 4
+    learning_rate: 0.001
+    weight_decay: 0.0001
+  seq_transformer_tail:
+    hidden_dim: 64
+    num_heads: 4
+    num_layers: 2
+    ff_multiplier: 2
+    dropout: 0.1
+    batch_size: 128
+    epochs: 20
+    patience: 4
+    learning_rate: 0.001
+    weight_decay: 0.0001
