@@ -192,6 +192,7 @@ models:
       num_layers: 2
       dropout: 0.1
   seq_tcn_tail:
+    graph_backend: neighbor_stats
     hidden_dim: 64
     tcn_channels:
       - 64
@@ -203,7 +204,12 @@ models:
     patience: 4
     learning_rate: 0.001
     weight_decay: 0.0001
+    gnn:
+      hidden_dim: 64
+      num_layers: 2
+      dropout: 0.1
   seq_transformer_tail:
+    graph_backend: neighbor_stats
     hidden_dim: 64
     num_heads: 4
     num_layers: 2
@@ -214,3 +220,7 @@ models:
     patience: 4
     learning_rate: 0.001
     weight_decay: 0.0001
+    gnn:
+      hidden_dim: 64
+      num_layers: 2
+      dropout: 0.1

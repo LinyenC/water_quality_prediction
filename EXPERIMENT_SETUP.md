@@ -87,18 +87,25 @@ Sequence options:
 - `seq_tcn_tail`
 - `seq_transformer_tail`
 
-## 6. Torch graph backend
+## 6. Graph backend options
 
-`torch_tail` now owns the graph choice instead of exposing a separate `gnn_tail` model.
+Both the tabular and sequence routes now expose the same graph-backend switch.
 
-Set `models.torch_tail.graph_backend` to one of:
+Set one of these to `none`, `neighbor_stats`, or `gnn`:
+
+- `models.torch_tail.graph_backend`
+- `models.seq_tcn_tail.graph_backend`
+- `models.seq_transformer_tail.graph_backend`
+
+Meaning of each option:
 
 - `neighbor_stats`
   - uses precomputed `graph_neighbor_*` features from `hydrotail/graph.py`
 - `gnn`
-  - removes those neighbor-summary features from the tabular input
-  - uses the station similarity graph directly inside `TorchTailModel`
+  - removes those neighbor-summary features from the direct input branch
+  - uses the station similarity graph directly inside the model
   - performs same-day graph propagation before the quantile and event heads
+  - for sequence models, graph propagation happens after the temporal encoder on the window end date
 - `none`
   - ignores the precomputed neighbor-summary features
 
@@ -106,16 +113,16 @@ Example:
 
 ```yaml
 models:
-  torch_tail:
+  seq_tcn_tail:
     graph_backend: gnn
-    hidden_dims: [128, 64]
+    hidden_dim: 64
     gnn:
       hidden_dim: 64
       num_layers: 2
       dropout: 0.1
 ```
 
-If you want to compare `neighbor_stats` and `gnn`, run two experiments with the same config except for `models.torch_tail.graph_backend`.
+If you want to compare `neighbor_stats` and `gnn`, run paired experiments with the same config except for the target model's `graph_backend`.
 
 ## 7. Output heads
 
@@ -161,11 +168,11 @@ For the folder-style dataset:
 python -m hydrotail.train --config configs/dataset_bundle_experiment.yaml
 ```
 
-To switch `torch_tail` from neighbor statistics to the internal GNN backend, change:
+To switch a model from neighbor statistics to the internal GNN backend, change for example:
 
 ```yaml
 models:
-  torch_tail:
+  seq_transformer_tail:
     graph_backend: gnn
 ```
 
@@ -180,15 +187,15 @@ python -m hydrotail.smoke_test
 The smoke test now runs two scenarios:
 
 - `outputs/smoke_test_neighbor_stats`
-  - verifies `torch_tail` with `graph_backend=neighbor_stats`
-  - also verifies the baseline and sequence models
+  - verifies `torch_tail`, `seq_tcn_tail`, and `seq_transformer_tail` with `graph_backend=neighbor_stats`
+  - also verifies the tabular baselines
 - `outputs/smoke_test_gnn`
-  - verifies `torch_tail` with `graph_backend=gnn`
+  - verifies `torch_tail`, `seq_tcn_tail`, and `seq_transformer_tail` with `graph_backend=gnn`
 
 This checks:
 
 - no learned point head
 - tabular baselines
 - sequence models
-- both graph-backend modes inside `torch_tail`
+- both graph-backend modes in tabular and sequence routes
 - extra period-slice analysis outputs

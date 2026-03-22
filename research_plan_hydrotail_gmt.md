@@ -52,7 +52,7 @@ Which watershed, meteorological, and seasonal factors are associated with predic
 
 1. The study focuses on `unseen-station generalization` rather than ordinary in-station forecasting.
 2. The framework jointly predicts `specific conductance` and `turbidity`, enabling comparison of transferability between ion-dominated and particle-dominated water-quality indicators.
-3. The model explicitly performs `tail-risk modeling` by producing point forecasts, quantile forecasts, and threshold exceedance probabilities.
+3. The model explicitly performs `tail-risk modeling` by producing `q0.5`-derived point estimates, quantile forecasts, and threshold exceedance probabilities.
 4. A `hydrologic similarity graph` is used to connect stations based on transferable physical similarity rather than only station identity or geographic distance.
 5. The evaluation highlights model robustness on tail events and failure mechanisms, not only average accuracy.
 
@@ -118,6 +118,11 @@ Purpose:
 - represent short- and medium-term dynamics
 - encode seasonality and persistence
 
+Current implementation note:
+
+- both `seq_tcn_tail` and `seq_transformer_tail` now support `graph_backend = none | neighbor_stats | gnn`
+- under `gnn`, the model first performs temporal encoding and then applies same-day graph propagation on the window end date
+
 ### 3. Hydrologic Similarity Graph
 
 Construct station relationships using:
@@ -155,7 +160,7 @@ Reason:
 
 Each target uses a joint regression-and-event design with three outputs:
 
-- point prediction
+- point estimate derived from `q0.5`
 - quantile prediction: `0.1 / 0.5 / 0.9`
 - exceedance probability: `P(y > threshold)`
 
@@ -187,7 +192,6 @@ This project should treat such monotonicity as an empirical option, not a univer
 
 Total loss can combine:
 
-- point loss: `Huber` or `MSE`
 - quantile loss: `Pinball Loss`
 - exceedance loss: `Binary Cross-Entropy`
 - optional boundary penalty for physical plausibility
@@ -199,7 +203,7 @@ Recommended tail-aware extension:
 
 Simple form:
 
-`L = alpha * L_point + beta * L_quantile + gamma * L_exceedance + delta * L_boundary`
+`L = beta * L_quantile + gamma * L_exceedance + delta * L_boundary`
 
 One practical implementation is:
 
@@ -238,6 +242,7 @@ Recommended baseline groups:
 
 Required ablations:
 
+- compare `graph_backend = none | neighbor_stats | gnn` in both tabular and sequence routes
 - remove graph module
 - replace hydrologic similarity graph with geographic distance graph
 - remove multi-task sharing
@@ -308,7 +313,7 @@ instead of claiming a totally novel deep-learning architecture.
 
 ## Draft Abstract
 
-This study targets daily forecasting of `specific conductance` and `turbidity` across multiple monitoring stations in the contiguous United States, with a particular focus on generalization to unseen stations and prediction of tail-risk events. To address strong spatial heterogeneity in climate, watershed characteristics, and hydrologic processes, we propose a hydrologic graph multi-task tail-learning framework that integrates historical time-series signals, meteorological drivers, and static watershed attributes. The framework jointly forecasts the two water-quality indicators while explicitly producing point estimates, quantile intervals, and threshold exceedance probabilities for extreme high turbidity and anomalously high conductance conditions. A hydrologic similarity graph is introduced to connect stations using transferable physical similarity rather than station identity alone, thereby improving prediction under new-station conditions. Model performance will be evaluated under temporal extrapolation, spatial extrapolation to unseen stations, and joint spatiotemporal extrapolation. Beyond average predictive accuracy, the study will examine tail-event performance and identify the hydrologic and watershed factors associated with transfer failure. The proposed framework is expected to support more robust cross-region water-quality forecasting and risk-aware early warning.
+This study targets daily forecasting of `specific conductance` and `turbidity` across multiple monitoring stations in the contiguous United States, with a particular focus on generalization to unseen stations and prediction of tail-risk events. To address strong spatial heterogeneity in climate, watershed characteristics, and hydrologic processes, we propose a hydrologic graph multi-task tail-learning framework that integrates historical time-series signals, meteorological drivers, and static watershed attributes. The framework jointly forecasts the two water-quality indicators while explicitly producing `q0.5`-derived point estimates, quantile intervals, and threshold exceedance probabilities for extreme high turbidity and anomalously high conductance conditions. A hydrologic similarity graph is introduced to connect stations using transferable physical similarity rather than station identity alone, thereby improving prediction under new-station conditions. Model performance will be evaluated under temporal extrapolation, spatial extrapolation to unseen stations, and joint spatiotemporal extrapolation. Beyond average predictive accuracy, the study will examine tail-event performance and identify the hydrologic and watershed factors associated with transfer failure. The proposed framework is expected to support more robust cross-region water-quality forecasting and risk-aware early warning.
 
 ## Writing Outline
 

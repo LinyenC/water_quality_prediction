@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 from sklearn.impute import SimpleImputer
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 from hydrotail.data import SequenceSamples
+from hydrotail.models.graph_backends import GraphBackbone, build_neighbor_map
 
 
 def _quantile_loss(
@@ -17,6 +20,7 @@ def _quantile_loss(
     target: torch.Tensor,
     quantiles: torch.Tensor,
     quantile_weights: torch.Tensor,
+    row_weight: torch.Tensor | None = None,
     valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if valid_mask is None:
@@ -26,14 +30,21 @@ def _quantile_loss(
 
     prediction = prediction[valid_mask]
     target = target[valid_mask]
+    if row_weight is not None:
+        row_weight = row_weight[valid_mask]
+
     errors = target.unsqueeze(-1) - prediction
     loss = torch.maximum(quantiles * errors, (quantiles - 1.0) * errors)
-    return (loss * quantile_weights).mean()
+    loss = (loss * quantile_weights).mean(dim=-1)
+    if row_weight is None:
+        return loss.mean()
+    return (loss * row_weight).sum() / row_weight.sum().clamp_min(1e-6)
 
 
 def _binary_event_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
+    row_weight: torch.Tensor | None = None,
     valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if valid_mask is None:
@@ -43,16 +54,43 @@ def _binary_event_loss(
 
     logits = logits[valid_mask]
     targets = targets[valid_mask]
-    return nn.functional.binary_cross_entropy_with_logits(logits, targets)
+    loss = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+    if row_weight is None:
+        return loss.mean()
+    row_weight = row_weight[valid_mask]
+    return (loss * row_weight).sum() / row_weight.sum().clamp_min(1e-6)
 
 
-def _boundary_loss(prediction: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
+def _boundary_loss(
+    prediction: torch.Tensor,
+    row_weight: torch.Tensor | None = None,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     if valid_mask is None:
         valid_mask = torch.ones(prediction.size(0), dtype=torch.bool, device=prediction.device)
     if not torch.any(valid_mask):
         return prediction.sum() * 0.0
+
     prediction = prediction[valid_mask]
-    return torch.relu(-prediction).mean()
+    loss = torch.relu(-prediction).mean(dim=-1)
+    if row_weight is None:
+        return loss.mean()
+    row_weight = row_weight[valid_mask]
+    return (loss * row_weight).sum() / row_weight.sum().clamp_min(1e-6)
+
+
+@dataclass
+class SequenceGraphSnapshot:
+    """Per-date graph snapshot for sequence models with a same-day GNN backend."""
+
+    row_indices: np.ndarray
+    sequence_values: np.ndarray
+    sequence_masks: np.ndarray
+    static_values: np.ndarray
+    adjacency: np.ndarray
+    targets: np.ndarray | None = None
+    events: np.ndarray | None = None
+    row_weight: np.ndarray | None = None
 
 
 class CausalConvBlock(nn.Module):
@@ -74,8 +112,8 @@ class CausalConvBlock(nn.Module):
         return self.activation(out + residual)
 
 
-class SequenceTailNet(nn.Module):
-    """Shared tail-aware network with either a TCN or Transformer temporal encoder."""
+class SequenceEncoder(nn.Module):
+    """Encode a lookback window into one fused station-day representation."""
 
     def __init__(
         self,
@@ -84,8 +122,6 @@ class SequenceTailNet(nn.Module):
         dynamic_dim: int,
         static_dim: int,
         hidden_dim: int,
-        target_names: list[str],
-        quantiles: list[float],
         model_cfg: dict[str, object],
     ) -> None:
         super().__init__()
@@ -114,6 +150,7 @@ class SequenceTailNet(nn.Module):
                 current_dim = channel_dim
             self.tcn_blocks = nn.ModuleList(blocks)
             temporal_output_dim = current_dim
+            self.transformer = None
         elif encoder_type == "transformer":
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=hidden_dim,
@@ -123,7 +160,11 @@ class SequenceTailNet(nn.Module):
                 batch_first=True,
                 norm_first=True,
             )
-            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=int(model_cfg.get("num_layers", 2)))
+            self.transformer = nn.TransformerEncoder(
+                encoder_layer,
+                num_layers=int(model_cfg.get("num_layers", 2)),
+            )
+            self.tcn_blocks = nn.ModuleList()
             temporal_output_dim = hidden_dim
         else:
             raise ValueError(f"Unsupported encoder_type: {encoder_type}")
@@ -145,11 +186,14 @@ class SequenceTailNet(nn.Module):
             nn.ReLU(),
             nn.Dropout(dropout),
         )
-        self.quantile_heads = nn.ModuleDict({name: nn.Linear(hidden_dim, len(quantiles)) for name in target_names})
-        self.event_heads = nn.ModuleDict({name: nn.Linear(hidden_dim, 1) for name in target_names})
 
-    def forward(self, sequence_values: torch.Tensor, sequence_masks: torch.Tensor, static_values: torch.Tensor) -> dict[str, dict[str, torch.Tensor]]:
-        # The model sees both imputed values and explicit masks, so irregular gaps stay visible.
+    def forward(
+        self,
+        sequence_values: torch.Tensor,
+        sequence_masks: torch.Tensor,
+        static_values: torch.Tensor,
+    ) -> torch.Tensor:
+        # The encoder sees both filled values and explicit masks, so missingness stays identifiable.
         seq_input = torch.cat([sequence_values, sequence_masks], dim=-1)
         hidden = self.input_projection(seq_input) + self.position_embedding[:, : seq_input.size(1), :]
 
@@ -159,6 +203,7 @@ class SequenceTailNet(nn.Module):
                 hidden = block(hidden)
             hidden = hidden.transpose(1, 2)
         else:
+            assert self.transformer is not None
             hidden = self.transformer(hidden)
 
         timestep_mask = (sequence_masks.sum(dim=-1) > 0).float()
@@ -169,16 +214,168 @@ class SequenceTailNet(nn.Module):
         if self.static_mlp is not None and static_values.size(-1) > 0:
             joint = torch.cat([joint, self.static_mlp(static_values)], dim=-1)
 
-        fused = self.fusion(joint)
+        return self.fusion(joint)
+
+class SequenceDenseTailNet(nn.Module):
+    """Sequence model with direct heads on the fused representation."""
+
+    def __init__(
+        self,
+        encoder_type: str,
+        lookback_window: int,
+        dynamic_dim: int,
+        static_dim: int,
+        hidden_dim: int,
+        target_names: list[str],
+        quantiles: list[float],
+        model_cfg: dict[str, object],
+    ) -> None:
+        super().__init__()
+        self.encoder = SequenceEncoder(
+            encoder_type=encoder_type,
+            lookback_window=lookback_window,
+            dynamic_dim=dynamic_dim,
+            static_dim=static_dim,
+            hidden_dim=hidden_dim,
+            model_cfg=model_cfg,
+        )
+        self.quantile_heads = nn.ModuleDict({name: nn.Linear(hidden_dim, len(quantiles)) for name in target_names})
+        self.event_heads = nn.ModuleDict({name: nn.Linear(hidden_dim, 1) for name in target_names})
+
+    def forward(
+        self,
+        sequence_values: torch.Tensor,
+        sequence_masks: torch.Tensor,
+        static_values: torch.Tensor,
+    ) -> dict[str, dict[str, torch.Tensor]]:
+        hidden = self.encoder(sequence_values, sequence_masks, static_values)
         outputs: dict[str, dict[str, torch.Tensor]] = {}
         for target_name in self.quantile_heads:
-            quantiles, _ = torch.sort(self.quantile_heads[target_name](fused), dim=-1)
+            quantiles, _ = torch.sort(self.quantile_heads[target_name](hidden), dim=-1)
             outputs[target_name] = {
                 "quantiles": quantiles,
-                "logit": self.event_heads[target_name](fused).squeeze(-1),
+                "logit": self.event_heads[target_name](hidden).squeeze(-1),
             }
         return outputs
 
+
+class SequenceGraphTailNet(nn.Module):
+    """Sequence model that adds same-day graph propagation after temporal encoding."""
+
+    def __init__(
+        self,
+        encoder_type: str,
+        lookback_window: int,
+        dynamic_dim: int,
+        static_dim: int,
+        encoder_hidden_dim: int,
+        graph_hidden_dim: int,
+        num_graph_layers: int,
+        dropout: float,
+        target_names: list[str],
+        quantiles: list[float],
+        model_cfg: dict[str, object],
+    ) -> None:
+        super().__init__()
+        self.encoder = SequenceEncoder(
+            encoder_type=encoder_type,
+            lookback_window=lookback_window,
+            dynamic_dim=dynamic_dim,
+            static_dim=static_dim,
+            hidden_dim=encoder_hidden_dim,
+            model_cfg=model_cfg,
+        )
+        self.graph = GraphBackbone(
+            input_dim=encoder_hidden_dim,
+            hidden_dim=graph_hidden_dim,
+            num_layers=num_graph_layers,
+            dropout=dropout,
+        )
+        self.quantile_heads = nn.ModuleDict({name: nn.Linear(graph_hidden_dim, len(quantiles)) for name in target_names})
+        self.event_heads = nn.ModuleDict({name: nn.Linear(graph_hidden_dim, 1) for name in target_names})
+
+    def forward(
+        self,
+        sequence_values: torch.Tensor,
+        sequence_masks: torch.Tensor,
+        static_values: torch.Tensor,
+        adjacency: torch.Tensor,
+    ) -> dict[str, dict[str, torch.Tensor]]:
+        encoded = self.encoder(sequence_values, sequence_masks, static_values)
+        hidden = self.graph(encoded, adjacency)
+        outputs: dict[str, dict[str, torch.Tensor]] = {}
+        for target_name in self.quantile_heads:
+            quantiles, _ = torch.sort(self.quantile_heads[target_name](hidden), dim=-1)
+            outputs[target_name] = {
+                "quantiles": quantiles,
+                "logit": self.event_heads[target_name](hidden).squeeze(-1),
+            }
+        return outputs
+
+
+def _build_sequence_graph_snapshots(
+    frame: pd.DataFrame,
+    sequence_values: np.ndarray,
+    sequence_masks: np.ndarray,
+    static_values: np.ndarray,
+    neighbor_map: dict[str, set[str]],
+    station_col: str,
+    date_col: str,
+    target_names: list[str] | None = None,
+    target_cols: dict[str, str] | None = None,
+    thresholds: dict[str, float] | None = None,
+    sample_weight: np.ndarray | None = None,
+) -> list[SequenceGraphSnapshot]:
+    """Build same-day station graphs for sequence-based GNN training or inference."""
+
+    aligned_frame = frame.reset_index(drop=True)
+    snapshots: list[SequenceGraphSnapshot] = []
+
+    for _, date_frame in aligned_frame.groupby(date_col, sort=True):
+        row_indices = date_frame.index.to_numpy(dtype=int)
+        station_ids = date_frame[station_col].astype(str).tolist()
+        local_index = {station_id: idx for idx, station_id in enumerate(station_ids)}
+
+        adjacency = np.eye(len(station_ids), dtype=np.float32)
+        for station_id, row_idx in local_index.items():
+            for neighbor_id in neighbor_map.get(station_id, set()):
+                if neighbor_id in local_index:
+                    adjacency[row_idx, local_index[neighbor_id]] = 1.0
+
+        degree = adjacency.sum(axis=1, keepdims=True)
+        adjacency = adjacency / np.clip(degree, a_min=1.0, a_max=None)
+
+        snapshot = SequenceGraphSnapshot(
+            row_indices=row_indices,
+            sequence_values=sequence_values[row_indices].astype(np.float32),
+            sequence_masks=sequence_masks[row_indices].astype(np.float32),
+            static_values=static_values[row_indices].astype(np.float32),
+            adjacency=adjacency,
+        )
+
+        if target_names is not None and target_cols is not None and thresholds is not None:
+            snapshot.targets = np.column_stack(
+                [date_frame[target_cols[target_name]].to_numpy(dtype=float) for target_name in target_names]
+            ).astype(np.float32)
+
+            event_columns: list[np.ndarray] = []
+            for target_name in target_names:
+                values = date_frame[target_cols[target_name]].to_numpy(dtype=float)
+                threshold = thresholds.get(target_name, float("nan"))
+                if np.isfinite(threshold):
+                    event_columns.append(np.where(np.isfinite(values), (values >= threshold).astype(float), 0.0))
+                else:
+                    event_columns.append(np.zeros(len(values), dtype=float))
+            snapshot.events = np.column_stack(event_columns).astype(np.float32)
+
+            if sample_weight is None:
+                snapshot.row_weight = np.ones(len(date_frame), dtype=np.float32)
+            else:
+                snapshot.row_weight = sample_weight[row_indices].astype(np.float32)
+
+        snapshots.append(snapshot)
+
+    return snapshots
 
 class SequenceTailModel:
     input_mode = "sequence"
@@ -199,10 +396,23 @@ class SequenceTailModel:
         self.quantile_weights = quantile_weights
         self.model_cfg = model_cfg
         self.random_state = random_state
+        self.graph_backend = str(self.model_cfg.get("graph_backend", "neighbor_stats")).lower()
+        if self.graph_backend not in {"none", "neighbor_stats", "gnn"}:
+            raise ValueError(f"Unsupported graph_backend: {self.graph_backend}")
+
         self.target_names: list[str] = []
         self.dynamic_medians: np.ndarray | None = None
+        self.static_feature_cols_: list[str] = []
         self.static_imputer = SimpleImputer(strategy="median")
-        self.model: SequenceTailNet | None = None
+        self.model: SequenceDenseTailNet | SequenceGraphTailNet | None = None
+        self.neighbor_map: dict[str, set[str]] = {}
+        self.station_col = "station_id"
+        self.date_col = "date"
+
+    def _resolve_static_feature_cols(self, static_feature_cols: list[str]) -> list[str]:
+        if self.graph_backend in {"none", "gnn"}:
+            return [col for col in static_feature_cols if not col.startswith("graph_neighbor_")]
+        return list(static_feature_cols)
 
     def _impute_dynamic(self, array: np.ndarray, fit: bool) -> np.ndarray:
         if fit:
@@ -218,17 +428,27 @@ class SequenceTailModel:
         return filled.astype(np.float32)
 
     def _prepare_bundle(self, bundle: SequenceSamples, fit: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        seq_values = self._impute_dynamic(bundle.sequence_values, fit=fit)
-        seq_masks = bundle.sequence_masks.astype(np.float32)
-        if bundle.static_values.shape[1] == 0:
-            static_values = bundle.static_values.astype(np.float32)
+        sequence_values = self._impute_dynamic(bundle.sequence_values, fit=fit)
+        sequence_masks = bundle.sequence_masks.astype(np.float32)
+
+        if not self.static_feature_cols_ or bundle.static_values.shape[1] == 0:
+            static_values = np.zeros((len(bundle.frame), 0), dtype=np.float32)
         else:
+            column_indices = [bundle.static_feature_cols.index(col) for col in self.static_feature_cols_]
+            selected_static = bundle.static_values[:, column_indices]
             if fit:
-                static_values = self.static_imputer.fit_transform(bundle.static_values)
+                static_values = self.static_imputer.fit_transform(selected_static)
             else:
-                static_values = self.static_imputer.transform(bundle.static_values)
+                static_values = self.static_imputer.transform(selected_static)
             static_values = static_values.astype(np.float32)
-        return seq_values, seq_masks, static_values
+
+        return sequence_values, sequence_masks, static_values
+
+    def _graph_cfg(self) -> dict[str, object]:
+        graph_cfg = self.model_cfg.get("gnn", {})
+        if not isinstance(graph_cfg, dict):
+            return {}
+        return graph_cfg
 
     def fit(
         self,
@@ -237,29 +457,102 @@ class SequenceTailModel:
         target_cols: dict[str, str],
         thresholds: dict[str, float],
         sample_weight: np.ndarray | None = None,
+        edge_df: pd.DataFrame | None = None,
+        station_col: str = "station_id",
+        date_col: str = "date",
     ) -> None:
         torch.manual_seed(self.random_state)
         np.random.seed(self.random_state)
+
         self.target_names = list(target_cols.keys())
+        self.station_col = station_col
+        self.date_col = date_col
+        self.static_feature_cols_ = self._resolve_static_feature_cols(train_bundle.static_feature_cols)
 
         train_values, train_masks, train_static = self._prepare_bundle(train_bundle, fit=True)
         valid_values, valid_masks, valid_static = self._prepare_bundle(valid_bundle, fit=False)
 
-        y_train = np.column_stack([train_bundle.frame[target_cols[name]].to_numpy(dtype=float) for name in self.target_names]).astype(np.float32)
-        y_valid = np.column_stack([valid_bundle.frame[target_cols[name]].to_numpy(dtype=float) for name in self.target_names]).astype(np.float32)
+        y_train = np.column_stack(
+            [train_bundle.frame[target_cols[name]].to_numpy(dtype=float) for name in self.target_names]
+        ).astype(np.float32)
+        y_valid = np.column_stack(
+            [valid_bundle.frame[target_cols[name]].to_numpy(dtype=float) for name in self.target_names]
+        ).astype(np.float32)
         e_train = np.column_stack(
             [
-                np.where(np.isfinite(train_bundle.frame[target_cols[name]].to_numpy(dtype=float)), (train_bundle.frame[target_cols[name]].to_numpy(dtype=float) >= thresholds[name]).astype(float), 0.0)
+                np.where(
+                    np.isfinite(train_bundle.frame[target_cols[name]].to_numpy(dtype=float)),
+                    (train_bundle.frame[target_cols[name]].to_numpy(dtype=float) >= thresholds[name]).astype(float),
+                    0.0,
+                )
                 for name in self.target_names
             ]
         ).astype(np.float32)
         e_valid = np.column_stack(
             [
-                np.where(np.isfinite(valid_bundle.frame[target_cols[name]].to_numpy(dtype=float)), (valid_bundle.frame[target_cols[name]].to_numpy(dtype=float) >= thresholds[name]).astype(float), 0.0)
+                np.where(
+                    np.isfinite(valid_bundle.frame[target_cols[name]].to_numpy(dtype=float)),
+                    (valid_bundle.frame[target_cols[name]].to_numpy(dtype=float) >= thresholds[name]).astype(float),
+                    0.0,
+                )
                 for name in self.target_names
             ]
         ).astype(np.float32)
 
+        quantiles_tensor = torch.tensor(self.quantiles, dtype=torch.float32)
+        quantile_weight_tensor = torch.tensor(self.quantile_weights, dtype=torch.float32)
+
+        if self.graph_backend == "gnn":
+            self._fit_with_gnn_backend(
+                train_bundle=train_bundle,
+                valid_bundle=valid_bundle,
+                train_values=train_values,
+                train_masks=train_masks,
+                train_static=train_static,
+                valid_values=valid_values,
+                valid_masks=valid_masks,
+                valid_static=valid_static,
+                target_cols=target_cols,
+                thresholds=thresholds,
+                quantiles_tensor=quantiles_tensor,
+                quantile_weight_tensor=quantile_weight_tensor,
+                sample_weight=sample_weight,
+                edge_df=edge_df,
+            )
+            return
+
+        self._fit_with_dense_backend(
+            train_values=train_values,
+            train_masks=train_masks,
+            train_static=train_static,
+            valid_values=valid_values,
+            valid_masks=valid_masks,
+            valid_static=valid_static,
+            y_train=y_train,
+            y_valid=y_valid,
+            e_train=e_train,
+            e_valid=e_valid,
+            quantiles_tensor=quantiles_tensor,
+            quantile_weight_tensor=quantile_weight_tensor,
+            sample_weight=sample_weight,
+        )
+
+    def _fit_with_dense_backend(
+        self,
+        train_values: np.ndarray,
+        train_masks: np.ndarray,
+        train_static: np.ndarray,
+        valid_values: np.ndarray,
+        valid_masks: np.ndarray,
+        valid_static: np.ndarray,
+        y_train: np.ndarray,
+        y_valid: np.ndarray,
+        e_train: np.ndarray,
+        e_valid: np.ndarray,
+        quantiles_tensor: torch.Tensor,
+        quantile_weight_tensor: torch.Tensor,
+        sample_weight: np.ndarray | None,
+    ) -> None:
         train_dataset = TensorDataset(
             torch.tensor(train_values),
             torch.tensor(train_masks),
@@ -277,12 +570,13 @@ class SequenceTailModel:
         )
         loader = DataLoader(train_dataset, batch_size=int(self.model_cfg.get("batch_size", 128)), sampler=sampler)
 
-        self.model = SequenceTailNet(
+        hidden_dim = int(self.model_cfg.get("hidden_dim", 64))
+        self.model = SequenceDenseTailNet(
             encoder_type=self.encoder_type,
             lookback_window=self.lookback_window,
             dynamic_dim=train_values.shape[-1],
             static_dim=train_static.shape[-1],
-            hidden_dim=int(self.model_cfg.get("hidden_dim", 64)),
+            hidden_dim=hidden_dim,
             target_names=self.target_names,
             quantiles=self.quantiles,
             model_cfg=self.model_cfg,
@@ -293,8 +587,6 @@ class SequenceTailModel:
             weight_decay=float(self.model_cfg.get("weight_decay", 1e-4)),
         )
 
-        q_tensor = torch.tensor(self.quantiles, dtype=torch.float32)
-        qw_tensor = torch.tensor(self.quantile_weights, dtype=torch.float32)
         best_state = copy.deepcopy(self.model.state_dict())
         best_valid = float("inf")
         patience = int(self.model_cfg.get("patience", 5))
@@ -321,8 +613,8 @@ class SequenceTailModel:
                     q_loss = _quantile_loss(
                         quantile_pred,
                         batch_targets[:, target_idx],
-                        q_tensor,
-                        qw_tensor,
+                        quantiles_tensor,
+                        quantile_weight_tensor,
                         valid_mask=valid_mask,
                     )
                     event_loss = _binary_event_loss(
@@ -335,7 +627,7 @@ class SequenceTailModel:
                 total_loss.backward()
                 optimizer.step()
 
-            valid_loss = self._validation_loss(valid_tensors, q_tensor, qw_tensor)
+            valid_loss = self._dense_validation_loss(valid_tensors, quantiles_tensor, quantile_weight_tensor)
             if valid_loss < best_valid:
                 best_valid = valid_loss
                 best_state = copy.deepcopy(self.model.state_dict())
@@ -348,7 +640,125 @@ class SequenceTailModel:
         self.model.load_state_dict(best_state)
         self.model.eval()
 
-    def _validation_loss(
+    def _fit_with_gnn_backend(
+        self,
+        train_bundle: SequenceSamples,
+        valid_bundle: SequenceSamples,
+        train_values: np.ndarray,
+        train_masks: np.ndarray,
+        train_static: np.ndarray,
+        valid_values: np.ndarray,
+        valid_masks: np.ndarray,
+        valid_static: np.ndarray,
+        target_cols: dict[str, str],
+        thresholds: dict[str, float],
+        quantiles_tensor: torch.Tensor,
+        quantile_weight_tensor: torch.Tensor,
+        sample_weight: np.ndarray | None,
+        edge_df: pd.DataFrame | None,
+    ) -> None:
+        if edge_df is None or edge_df.empty:
+            raise RuntimeError("graph_backend='gnn' requires a non-empty edge_df. Enable the graph block in the config.")
+
+        self.neighbor_map = build_neighbor_map(edge_df)
+        if not self.neighbor_map:
+            raise RuntimeError("graph_backend='gnn' requires at least one valid graph edge.")
+
+        if sample_weight is None:
+            train_targets = np.column_stack(
+                [train_bundle.frame[target_cols[name]].to_numpy(dtype=float) for name in self.target_names]
+            )
+            train_events = []
+            for target_idx, target_name in enumerate(self.target_names):
+                threshold = thresholds.get(target_name, float("nan"))
+                if np.isfinite(threshold):
+                    target_values = train_targets[:, target_idx]
+                    train_events.append(np.where(np.isfinite(target_values), (target_values >= threshold).astype(float), 0.0))
+                else:
+                    train_events.append(np.zeros(len(train_bundle.frame), dtype=float))
+            sample_weight = 1.0 + float(self.model_cfg.get("tail_weight_multiplier", 1.0)) * np.max(
+                np.column_stack(train_events),
+                axis=1,
+            )
+
+        train_snapshots = _build_sequence_graph_snapshots(
+            frame=train_bundle.frame,
+            sequence_values=train_values,
+            sequence_masks=train_masks,
+            static_values=train_static,
+            neighbor_map=self.neighbor_map,
+            station_col=self.station_col,
+            date_col=self.date_col,
+            target_names=self.target_names,
+            target_cols=target_cols,
+            thresholds=thresholds,
+            sample_weight=sample_weight,
+        )
+        valid_snapshots = _build_sequence_graph_snapshots(
+            frame=valid_bundle.frame,
+            sequence_values=valid_values,
+            sequence_masks=valid_masks,
+            static_values=valid_static,
+            neighbor_map=self.neighbor_map,
+            station_col=self.station_col,
+            date_col=self.date_col,
+            target_names=self.target_names,
+            target_cols=target_cols,
+            thresholds=thresholds,
+        )
+
+        hidden_dim = int(self.model_cfg.get("hidden_dim", 64))
+        graph_cfg = self._graph_cfg()
+        graph_hidden_dim = int(graph_cfg.get("hidden_dim", hidden_dim))
+        num_graph_layers = int(graph_cfg.get("num_layers", 2))
+        dropout = float(graph_cfg.get("dropout", self.model_cfg.get("dropout", 0.1)))
+
+        self.model = SequenceGraphTailNet(
+            encoder_type=self.encoder_type,
+            lookback_window=self.lookback_window,
+            dynamic_dim=train_values.shape[-1],
+            static_dim=train_static.shape[-1],
+            encoder_hidden_dim=hidden_dim,
+            graph_hidden_dim=graph_hidden_dim,
+            num_graph_layers=num_graph_layers,
+            dropout=dropout,
+            target_names=self.target_names,
+            quantiles=self.quantiles,
+            model_cfg=self.model_cfg,
+        )
+        optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=float(self.model_cfg.get("learning_rate", 1e-3)),
+            weight_decay=float(self.model_cfg.get("weight_decay", 1e-4)),
+        )
+
+        best_state = copy.deepcopy(self.model.state_dict())
+        best_valid = float("inf")
+        patience = int(self.model_cfg.get("patience", 5))
+        wait = 0
+
+        for _epoch in range(int(self.model_cfg.get("epochs", 20))):
+            self.model.train()
+            for snapshot in train_snapshots:
+                optimizer.zero_grad()
+                loss = self._graph_snapshot_loss(snapshot, quantiles_tensor, quantile_weight_tensor)
+                loss.backward()
+                optimizer.step()
+
+            valid_loss = self._graph_validation_loss(valid_snapshots, quantiles_tensor, quantile_weight_tensor)
+            if valid_loss < best_valid:
+                best_valid = valid_loss
+                best_state = copy.deepcopy(self.model.state_dict())
+                wait = 0
+            else:
+                wait += 1
+                if wait >= patience:
+                    break
+
+        self.model.load_state_dict(best_state)
+        self.model.eval()
+
+    def _dense_validation_loss(
         self,
         valid_tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         quantiles: torch.Tensor,
@@ -379,11 +789,80 @@ class SequenceTailModel:
                 total_loss += float(q_loss + event_loss + 0.1 * boundary_loss)
             return total_loss
 
+    def _graph_snapshot_loss(
+        self,
+        snapshot: SequenceGraphSnapshot,
+        quantiles: torch.Tensor,
+        quantile_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self.model is not None
+        assert snapshot.targets is not None
+        assert snapshot.events is not None
+        assert snapshot.row_weight is not None
+
+        sequence_values = torch.tensor(snapshot.sequence_values, dtype=torch.float32)
+        sequence_masks = torch.tensor(snapshot.sequence_masks, dtype=torch.float32)
+        static_values = torch.tensor(snapshot.static_values, dtype=torch.float32)
+        adjacency = torch.tensor(snapshot.adjacency, dtype=torch.float32)
+        targets = torch.tensor(snapshot.targets, dtype=torch.float32)
+        events = torch.tensor(snapshot.events, dtype=torch.float32)
+        row_weight = torch.tensor(snapshot.row_weight, dtype=torch.float32)
+        outputs = self.model(sequence_values, sequence_masks, static_values, adjacency)
+
+        total_loss = torch.tensor(0.0, dtype=torch.float32)
+        for target_idx, target_name in enumerate(self.target_names):
+            valid_mask = torch.isfinite(targets[:, target_idx])
+            quantile_pred = outputs[target_name]["quantiles"]
+            event_logit = outputs[target_name]["logit"]
+            q_loss = _quantile_loss(
+                quantile_pred,
+                targets[:, target_idx],
+                quantiles,
+                quantile_weights,
+                row_weight=row_weight,
+                valid_mask=valid_mask,
+            )
+            event_loss = _binary_event_loss(
+                event_logit,
+                events[:, target_idx],
+                row_weight=row_weight,
+                valid_mask=valid_mask,
+            )
+            boundary_loss = _boundary_loss(quantile_pred, row_weight=row_weight, valid_mask=valid_mask)
+            total_loss = total_loss + q_loss + event_loss + 0.1 * boundary_loss
+        return total_loss
+
+    def _graph_validation_loss(
+        self,
+        snapshots: list[SequenceGraphSnapshot],
+        quantiles: torch.Tensor,
+        quantile_weights: torch.Tensor,
+    ) -> float:
+        assert self.model is not None
+        total_loss = 0.0
+        with torch.no_grad():
+            for snapshot in snapshots:
+                total_loss += float(self._graph_snapshot_loss(snapshot, quantiles, quantile_weights))
+        return total_loss / max(len(snapshots), 1)
+
+    def _empty_predictions(self, row_count: int) -> dict[str, dict[str, object]]:
+        return {
+            target_name: {
+                "point": np.zeros(row_count, dtype=float),
+                "quantiles": {quantile: np.zeros(row_count, dtype=float) for quantile in self.quantiles},
+                "exceedance_probability": np.zeros(row_count, dtype=float),
+            }
+            for target_name in self.target_names
+        }
+
     def predict(self, bundle: SequenceSamples) -> dict[str, dict[str, object]]:
         if self.model is None:
             raise RuntimeError("Model has not been fitted.")
 
         sequence_values, sequence_masks, static_values = self._prepare_bundle(bundle, fit=False)
+        if self.graph_backend == "gnn":
+            return self._predict_with_gnn_backend(bundle.frame, sequence_values, sequence_masks, static_values)
+
         with torch.no_grad():
             outputs = self.model(
                 torch.tensor(sequence_values),
@@ -391,14 +870,53 @@ class SequenceTailModel:
                 torch.tensor(static_values),
             )
 
-        predictions: dict[str, dict[str, object]] = {}
+        predictions = self._empty_predictions(len(bundle.frame))
         for target_name in self.target_names:
             quantile_matrix = outputs[target_name]["quantiles"].numpy()
-            predictions[target_name] = {
-                "point": quantile_matrix[:, self.point_quantile_index],
-                "quantiles": {quantile: quantile_matrix[:, idx] for idx, quantile in enumerate(self.quantiles)},
-                "exceedance_probability": torch.sigmoid(outputs[target_name]["logit"]).numpy(),
+            predictions[target_name]["point"] = quantile_matrix[:, self.point_quantile_index]
+            predictions[target_name]["quantiles"] = {
+                quantile: quantile_matrix[:, idx] for idx, quantile in enumerate(self.quantiles)
             }
+            predictions[target_name]["exceedance_probability"] = torch.sigmoid(outputs[target_name]["logit"]).numpy()
+        return predictions
+
+    def _predict_with_gnn_backend(
+        self,
+        frame: pd.DataFrame,
+        sequence_values: np.ndarray,
+        sequence_masks: np.ndarray,
+        static_values: np.ndarray,
+    ) -> dict[str, dict[str, object]]:
+        assert self.model is not None
+
+        snapshots = _build_sequence_graph_snapshots(
+            frame=frame,
+            sequence_values=sequence_values,
+            sequence_masks=sequence_masks,
+            static_values=static_values,
+            neighbor_map=self.neighbor_map,
+            station_col=self.station_col,
+            date_col=self.date_col,
+        )
+        predictions = self._empty_predictions(len(frame))
+
+        with torch.no_grad():
+            for snapshot in snapshots:
+                outputs = self.model(
+                    torch.tensor(snapshot.sequence_values, dtype=torch.float32),
+                    torch.tensor(snapshot.sequence_masks, dtype=torch.float32),
+                    torch.tensor(snapshot.static_values, dtype=torch.float32),
+                    torch.tensor(snapshot.adjacency, dtype=torch.float32),
+                )
+                for target_name in self.target_names:
+                    quantile_matrix = outputs[target_name]["quantiles"].numpy()
+                    predictions[target_name]["point"][snapshot.row_indices] = quantile_matrix[:, self.point_quantile_index]
+                    for idx, quantile in enumerate(self.quantiles):
+                        predictions[target_name]["quantiles"][quantile][snapshot.row_indices] = quantile_matrix[:, idx]
+                    predictions[target_name]["exceedance_probability"][snapshot.row_indices] = (
+                        torch.sigmoid(outputs[target_name]["logit"]).numpy()
+                    )
+
         return predictions
 
     def save(self, path: str | Path) -> None:

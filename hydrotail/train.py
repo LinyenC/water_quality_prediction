@@ -287,7 +287,16 @@ def run_experiment(config_path: str) -> None:
                     thresholds=thresholds,
                     multiplier=float(config["tail"].get("tail_weight_multiplier", 4.0)),
                 )
-                model.fit(sequence_train, sequence_valid, target_cols, thresholds, sample_weight=sequence_sample_weight)
+                model.fit(
+                    sequence_train,
+                    sequence_valid,
+                    target_cols,
+                    thresholds,
+                    sample_weight=sequence_sample_weight,
+                    edge_df=edge_df,
+                    station_col=station_col,
+                    date_col=date_col,
+                )
                 for group_name, bundle in sequence_groups.items():
                     if len(bundle) == 0:
                         continue

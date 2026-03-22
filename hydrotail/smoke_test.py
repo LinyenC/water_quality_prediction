@@ -170,6 +170,7 @@ def _make_base_config(dynamic_path: Path, static_path: Path, output_dir: Path) -
                 "gnn": {"hidden_dim": 32, "num_layers": 2, "dropout": 0.1},
             },
             "seq_tcn_tail": {
+                "graph_backend": "neighbor_stats",
                 "hidden_dim": 32,
                 "tcn_channels": [32, 32],
                 "kernel_size": 3,
@@ -179,8 +180,10 @@ def _make_base_config(dynamic_path: Path, static_path: Path, output_dir: Path) -
                 "patience": 1,
                 "learning_rate": 0.001,
                 "weight_decay": 0.0001,
+                "gnn": {"hidden_dim": 32, "num_layers": 2, "dropout": 0.1},
             },
             "seq_transformer_tail": {
+                "graph_backend": "neighbor_stats",
                 "hidden_dim": 32,
                 "num_heads": 4,
                 "num_layers": 1,
@@ -191,6 +194,7 @@ def _make_base_config(dynamic_path: Path, static_path: Path, output_dir: Path) -
                 "patience": 1,
                 "learning_rate": 0.001,
                 "weight_decay": 0.0001,
+                "gnn": {"hidden_dim": 32, "num_layers": 2, "dropout": 0.1},
             },
         },
     }
@@ -220,8 +224,10 @@ def main() -> None:
 
     gnn_output_dir = output_root / "smoke_test_gnn"
     gnn_config = _make_base_config(dynamic_path, static_path, gnn_output_dir)
-    gnn_config["run"]["models"] = ["torch_tail"]
+    gnn_config["run"]["models"] = ["torch_tail", "seq_tcn_tail", "seq_transformer_tail"]
     gnn_config["models"]["torch_tail"]["graph_backend"] = "gnn"
+    gnn_config["models"]["seq_tcn_tail"]["graph_backend"] = "gnn"
+    gnn_config["models"]["seq_transformer_tail"]["graph_backend"] = "gnn"
     _run_scenario(config_dir, "smoke_test_gnn.yaml", gnn_config)
 
 
