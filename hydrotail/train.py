@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
+import shutil
+import time
 
 import numpy as np
 import pandas as pd
@@ -14,6 +17,7 @@ from hydrotail.models import GBDTTailModel, LinearTailModel, SequenceTailModel, 
 from hydrotail.splits import assign_splits
 
 
+LOGGER = logging.getLogger(__name__)
 SEQUENCE_MODEL_NAMES = {"seq_tcn_tail", "seq_transformer_tail"}
 ANALYSIS_GROUP_NAMES = [
     "train_station_early",
@@ -21,6 +25,20 @@ ANALYSIS_GROUP_NAMES = [
     "test_station_early",
     "test_station_late",
 ]
+
+
+def _configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        force=True,
+    )
+
+
+def _frame_station_count(frame: pd.DataFrame, station_col: str) -> int:
+    if station_col not in frame.columns:
+        return 0
+    return int(frame[station_col].nunique())
 
 
 def _compute_thresholds(train_frame: pd.DataFrame, target_cols: dict[str, str], tail_cfg: dict[str, object]) -> dict[str, float]:
@@ -125,35 +143,38 @@ def _evaluate_predictions(
             metrics[target_name] = _empty_target_metrics(quantiles)
             continue
 
-        y_true_valid = y_true[valid_mask]
-        point_pred = np.asarray(predictions[target_name]["point"], dtype=float)[valid_mask]
-        q_pred = {
-            quantile: np.asarray(predictions[target_name]["quantiles"][quantile], dtype=float)[valid_mask]
+        point_all = np.asarray(predictions[target_name]["point"], dtype=float)
+        q_all = {
+            quantile: np.asarray(predictions[target_name]["quantiles"][quantile], dtype=float)
             for quantile in quantiles
         }
-        event_prob = np.asarray(predictions[target_name]["exceedance_probability"], dtype=float)[valid_mask]
+        event_all = np.asarray(predictions[target_name]["exceedance_probability"], dtype=float)
         threshold = thresholds.get(target_name, float("nan"))
 
-        target_metrics = {"observed_count": int(valid_mask.sum())}
-        target_metrics.update(regression_metrics(y_true_valid, point_pred))
-        target_metrics.update(quantile_metrics(y_true_valid, q_pred, quantiles))
+        target_metrics = _empty_target_metrics(quantiles)
+        target_metrics["observed_count"] = int(valid_mask.sum())
+
+        point_mask = valid_mask & np.isfinite(point_all)
+        if np.any(point_mask):
+            target_metrics.update(regression_metrics(y_true[point_mask], point_all[point_mask]))
+            if np.isfinite(threshold):
+                tail_metrics = evaluate_tail_subset(y_true[point_mask], point_all[point_mask], threshold)
+                for key, value in tail_metrics.items():
+                    target_metrics[f"tail_{key}"] = value
+
+        quantile_mask = valid_mask.copy()
+        for quantile in quantiles:
+            quantile_mask &= np.isfinite(q_all[quantile])
+        if np.any(quantile_mask):
+            q_true = y_true[quantile_mask]
+            q_pred = {quantile: q_all[quantile][quantile_mask] for quantile in quantiles}
+            target_metrics.update(quantile_metrics(q_true, q_pred, quantiles))
 
         if np.isfinite(threshold):
-            event_true = (y_true_valid >= threshold).astype(int)
-            target_metrics.update(classification_metrics(event_true, event_prob))
-            tail_metrics = evaluate_tail_subset(y_true_valid, point_pred, threshold)
-            for key, value in tail_metrics.items():
-                target_metrics[f"tail_{key}"] = value
-        else:
-            target_metrics.update(
-                {
-                    "f1": float("nan"),
-                    "precision": float("nan"),
-                    "recall": float("nan"),
-                    "auc": float("nan"),
-                    "tail_count": 0,
-                }
-            )
+            event_mask = valid_mask & np.isfinite(event_all)
+            if np.any(event_mask):
+                event_true = (y_true[event_mask] >= threshold).astype(int)
+                target_metrics.update(classification_metrics(event_true, event_all[event_mask]))
 
         metrics[target_name] = target_metrics
     return metrics
@@ -163,6 +184,12 @@ def _save_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
+
+
+def _save_config_snapshot(config_path: Path, destination_dir: Path) -> None:
+    """Save the original YAML config alongside experiment outputs for reproducibility."""
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(config_path, destination_dir / "experiment_config.yaml")
 
 
 def _save_predictions(
@@ -211,21 +238,49 @@ def _collect_eval_sequence_groups(sequence_all: SequenceSamples) -> dict[str, Se
 
 
 def run_experiment(config_path: str) -> None:
-    config = load_config(config_path)
+    resolved_config_path = Path(config_path).resolve()
+    LOGGER.info("Loading config from %s", resolved_config_path)
+    config = load_config(resolved_config_path)
     seed = int(config["splits"].get("seed", 42))
     output_dir = Path(config["paths"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
+    _save_config_snapshot(resolved_config_path, output_dir)
+    LOGGER.info("Experiment output directory: %s", output_dir)
 
+    dataset_start = time.perf_counter()
+    LOGGER.info("Loading datasets...")
     dynamic_df, static_df = load_datasets(config)
+    LOGGER.info(
+        "Loaded datasets in %.1fs: dynamic_rows=%s dynamic_stations=%s static_rows=%s static_stations=%s",
+        time.perf_counter() - dataset_start,
+        len(dynamic_df),
+        _frame_station_count(dynamic_df, config["data"]["station_col"]),
+        0 if static_df is None else len(static_df),
+        0 if static_df is None else _frame_station_count(static_df, config["data"]["station_col"]),
+    )
+
     quantiles = [float(value) for value in config["tail"]["quantiles"]]
     quantile_weights = [float(value) for value in config["tail"]["quantile_weights"]]
     model_names = list(config["run"]["models"])
     horizons = list(config["features"].get("horizons", [1]))
     station_col = config["data"]["station_col"]
     date_col = config["data"]["date_col"]
+    LOGGER.info("Configured horizons=%s models=%s", horizons, model_names)
 
     for horizon in horizons:
+        horizon_start = time.perf_counter()
+        LOGGER.info("Building model frame for horizon=%s", horizon)
         frame, feature_cols, target_cols, edge_df = build_model_frame(dynamic_df, static_df, config, horizon=int(horizon))
+        LOGGER.info(
+            "Built model frame for horizon=%s: rows=%s stations=%s features=%s targets=%s edges=%s",
+            horizon,
+            len(frame),
+            _frame_station_count(frame, station_col),
+            len(feature_cols),
+            list(target_cols.keys()),
+            len(edge_df),
+        )
+
         split_bundle = assign_splits(
             frame,
             station_col=station_col,
@@ -233,8 +288,12 @@ def run_experiment(config_path: str) -> None:
             split_cfg=config["splits"],
         )
         frame = split_bundle.frame
+        LOGGER.info("Split counts for horizon=%s: %s", horizon, split_bundle.metadata.get("counts", {}))
+        LOGGER.info("Analysis counts for horizon=%s: %s", horizon, split_bundle.metadata.get("analysis_counts", {}))
+
         horizon_dir = output_dir / f"horizon_{horizon}"
         horizon_dir.mkdir(parents=True, exist_ok=True)
+        _save_config_snapshot(resolved_config_path, horizon_dir)
         _save_json(horizon_dir / "split_metadata.json", split_bundle.metadata)
         if not edge_df.empty:
             edge_df.to_csv(horizon_dir / "graph_edges.csv", index=False)
@@ -247,6 +306,7 @@ def run_experiment(config_path: str) -> None:
             raise RuntimeError("One or more tabular data splits are empty. Adjust station fractions or time fractions in the config.")
 
         thresholds = _compute_thresholds(train_frame, target_cols, config["tail"])
+        LOGGER.info("Thresholds for horizon=%s: %s", horizon, thresholds)
         tabular_sample_weight = _compute_sample_weights(
             train_frame,
             target_cols=target_cols,
@@ -257,22 +317,27 @@ def run_experiment(config_path: str) -> None:
 
         sequence_groups: dict[str, SequenceSamples] | None = None
         if any(model_name in SEQUENCE_MODEL_NAMES for model_name in model_names):
+            LOGGER.info("Building sequence samples for horizon=%s", horizon)
             sequence_all = build_sequence_samples(frame, config, target_cols)
             sequence_groups = _collect_eval_sequence_groups(sequence_all)
             for split_name in ("train", "valid", "test"):
                 if len(sequence_groups[split_name]) == 0:
                     raise RuntimeError(f"No sequence samples were created for split `{split_name}`.")
+            sample_counts = {group_name: len(bundle) for group_name, bundle in sequence_groups.items()}
+            LOGGER.info("Sequence sample counts for horizon=%s: %s", horizon, sample_counts)
             _save_json(
                 horizon_dir / "sequence_metadata.json",
                 {
                     "lookback_window": int(config.get("sequence", {}).get("lookback_window", 30)),
-                    "sample_counts": {group_name: len(bundle) for group_name, bundle in sequence_groups.items()},
+                    "sample_counts": sample_counts,
                     "sequence_feature_count": len(sequence_all.sequence_feature_cols),
                     "static_feature_count": len(sequence_all.static_feature_cols),
                 },
             )
 
         for model_name in model_names:
+            model_start = time.perf_counter()
+            LOGGER.info("Training model=%s horizon=%s", model_name, horizon)
             model_dir = horizon_dir / model_name
             model_dir.mkdir(parents=True, exist_ok=True)
             model = _instantiate_model(model_name, config, quantiles, quantile_weights, seed)
@@ -336,9 +401,21 @@ def run_experiment(config_path: str) -> None:
                     _save_predictions(group_frame, predictions, target_cols, quantiles, model_dir / f"{group_name}_predictions.csv")
 
             model.save(model_dir / "model.bin")
+            LOGGER.info(
+                "Finished model=%s horizon=%s in %.1fs; outputs=%s",
+                model_name,
+                horizon,
+                time.perf_counter() - model_start,
+                model_dir,
+            )
+
+        LOGGER.info("Finished horizon=%s in %.1fs", horizon, time.perf_counter() - horizon_start)
+
+    LOGGER.info("Experiment completed successfully.")
 
 
 def main() -> None:
+    _configure_logging()
     parser = argparse.ArgumentParser(description="Run HydroTail experiments.")
     parser.add_argument("--config", required=True, help="Path to YAML config.")
     args = parser.parse_args()

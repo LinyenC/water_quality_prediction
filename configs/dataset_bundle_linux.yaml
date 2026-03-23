@@ -1,11 +1,8 @@
 project:
-  name: hydrotail_dataset_bundle
+  name: hydrotail_linux
 paths:
-  dataset_root: dataset
-  attributes_root: F:\jupyter_notebook\wat_quality_pred\dataset\attritubes
-  time_series_root: F:\jupyter_notebook\baseflow_predict\dataset\time_series
-  wq_root: F:\jupyter_notebook\wat_quality_pred\dataset\WQ
-  output_dir: outputs/dataset_bundle_run
+  dataset_root: /data/data2/linyen3/wat_quality_pred/dataset
+  output_dir: /data/data2/linyen3/wat_quality_pred/outputs/dataset_bundle_run
 data:
   station_col: station_id
   station_id_width: 8
@@ -178,6 +175,7 @@ models:
     learning_rate: 0.05
     min_samples_leaf: 20
   torch_tail:
+    device: cuda:0
     graph_backend: neighbor_stats
     hidden_dims:
     - 128
@@ -193,6 +191,7 @@ models:
       num_layers: 2
       dropout: 0.1
   seq_tcn_tail:
+    device: cuda:0
     graph_backend: neighbor_stats
     hidden_dim: 64
     tcn_channels:
@@ -210,6 +209,7 @@ models:
       num_layers: 2
       dropout: 0.1
   seq_transformer_tail:
+    device: cuda:0
     graph_backend: neighbor_stats
     hidden_dim: 64
     num_heads: 4

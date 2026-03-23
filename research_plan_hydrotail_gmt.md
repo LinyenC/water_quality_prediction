@@ -238,6 +238,20 @@ Recommended baseline groups:
 - multi-task model without graph
 - graph model without tail heads
 
+Current codebase status:
+
+- already implemented:
+  - `linear_tail`
+  - `gbdt_tail`
+  - `torch_tail`
+  - `seq_tcn_tail`
+  - `seq_transformer_tail`
+- not yet implemented as dedicated baselines in the current repo:
+  - `Persistence`
+  - `LSTM`
+  - `TFT`
+  - `LightGBM` / `XGBoost` as separate named routes
+
 ## Ablation Design
 
 Required ablations:
@@ -311,6 +325,42 @@ This study can claim contribution more safely through:
 
 instead of claiming a totally novel deep-learning architecture.
 
+## Current Implementation Snapshot (2026-03-22)
+
+The project is no longer at the purely conceptual stage. The current repo already contains a runnable experiment framework with the following status:
+
+- data ingestion:
+  - supports both flat-table input and directory-style dataset bundles
+  - supports either one unified `dataset_root` or separate roots for:
+    - `attributes_root`
+    - `time_series_root`
+    - `wq_root`
+- implemented model routes:
+  - tabular baselines: `linear_tail`, `gbdt_tail`
+  - main deep tabular route: `torch_tail`
+  - sequence routes: `seq_tcn_tail`, `seq_transformer_tail`
+- graph integration:
+  - all deep routes now support `graph_backend = none | neighbor_stats | gnn`
+- tail-aware outputs:
+  - `q0.5`-derived point prediction
+  - quantile outputs
+  - exceedance probability outputs
+- deployment:
+  - a Linux server run path has already been validated
+  - code directory: `/home/linyen3/wat_quality_pred`
+  - dataset directory: `/data/data2/linyen3/wat_quality_pred/dataset`
+  - output directory: `/data/data2/linyen3/wat_quality_pred/outputs`
+- GPU support:
+  - deep models now accept explicit `device` settings such as `cpu`, `cuda`, `cuda:0`, `cuda:1`
+  - the current Linux config pins deep models to `cuda:0`
+  - on the current server, `cuda:0` corresponds to `NVIDIA GeForce RTX 3090`
+
+Current practical bottleneck:
+
+- the first real-data server run has already started
+- however, the main early bottleneck is still dataset loading and pandas-side feature preparation
+- this is expected because the current dataset includes thousands of per-station files rather than one pre-merged cache
+
 ## Draft Abstract
 
 This study targets daily forecasting of `specific conductance` and `turbidity` across multiple monitoring stations in the contiguous United States, with a particular focus on generalization to unseen stations and prediction of tail-risk events. To address strong spatial heterogeneity in climate, watershed characteristics, and hydrologic processes, we propose a hydrologic graph multi-task tail-learning framework that integrates historical time-series signals, meteorological drivers, and static watershed attributes. The framework jointly forecasts the two water-quality indicators while explicitly producing `q0.5`-derived point estimates, quantile intervals, and threshold exceedance probabilities for extreme high turbidity and anomalously high conductance conditions. A hydrologic similarity graph is introduced to connect stations using transferable physical similarity rather than station identity alone, thereby improving prediction under new-station conditions. Model performance will be evaluated under temporal extrapolation, spatial extrapolation to unseen stations, and joint spatiotemporal extrapolation. Beyond average predictive accuracy, the study will examine tail-event performance and identify the hydrologic and watershed factors associated with transfer failure. The proposed framework is expected to support more robust cross-region water-quality forecasting and risk-aware early warning.
@@ -349,11 +399,107 @@ Suggested key discussion points:
 
 ## Next Practical Steps
 
-1. check data completeness for `specific conductance` and `turbidity`
-2. unify station IDs, timestamps, and units
-3. define unseen-station split
-4. create lag and rolling features
-5. collect static watershed attributes
-6. build strong non-deep baseline first
-7. implement `HydroTail-GMT`
-8. run tail-event and generalization evaluations
+1. add a cached merged bundle for the current real dataset to reduce the first-run loading cost
+2. add progress logging around dataset loading, feature construction, horizon start, and model start
+3. complete the first real-data Linux run with `linear_tail` and `gbdt_tail` as sanity-check baselines
+4. verify the first GPU-backed `torch_tail` run on `graph_backend = none`
+5. compare `torch_tail` across `none | neighbor_stats | gnn`
+6. only after the tabular route is stable, expand to `seq_tcn_tail` and `seq_transformer_tail`
+7. report both overall performance and tail-event performance under unseen-station and joint spatiotemporal extrapolation
+
+## Implementation Update (2026-03-23)
+
+A new data-ingestion stabilization pass has now been completed for the real multi-file dataset.
+
+What changed:
+
+- coverage-aware smoke subset selection:
+  - when `station_limit` is enabled, the loader no longer defaults to the first N WQ stations
+  - it now prefers a subset that covers all configured targets, which is especially important for `conductance` + `turbidity` multi-task smoke runs
+- parquet caching at the bundle level:
+  - the directory-style loader now writes component caches for `attributes`, `time_series`, and `wq_observations`
+  - cache namespaces are derived from the current dataset roots and smoke-subset specification so repeated smoke runs can reuse cached tables safely
+- float32 downcast:
+  - numeric columns are downcast after bundle loading and again after feature construction to reduce memory usage on sparse station-day frames
+- smoke split adjustment for sparse targets:
+  - the Linux smoke config now uses `unseen_station`
+  - the main Linux experiment config still keeps `unseen_station_and_future`
+
+Why this mattered:
+
+- the previous smoke run already proved that the code path was runnable, but the dataset-loading stage still dominated wall-clock time
+- sparse targets can disappear from the train partition under a strict spatiotemporal smoke split even when those targets are present in the selected stations overall
+- the new smoke configuration is therefore meant to verify the end-to-end multi-target pipeline first, before returning to the stricter main split for full experiments
+
+Current observed server status after the update:
+
+- cold cache build on the 32-station Linux smoke subset successfully wrote:
+  - `attributes.parquet`
+  - `time_series.parquet`
+  - `wq_observations.parquet`
+- warm cache reuse reduced dataset loading to sub-second scale on the same smoke subset
+- the updated smoke run now produces finite thresholds for both targets, including `turbidity`
+
+## Revised Next Practical Steps
+
+1. finish the cached Linux smoke run and archive its exact metrics as the new baseline sanity check
+2. rerun the main Linux config with `unseen_station_and_future` to quantify how much sparse-target coverage remains under the true research split
+3. if turbidity remains too sparse under the main split, decide explicitly whether the paper task should be:
+   - next-day daily prediction, or
+   - next-observed-value prediction
+4. after the split definition is fixed, compare `torch_tail` across `none | neighbor_stats | gnn`
+5. only then expand the real-data sequence experiments to `seq_tcn_tail` and `seq_transformer_tail`
+
+## Static attribute set update (2026-03-23)
+
+The formal experiment configuration has now moved beyond the initial 15-feature core static set.
+
+The current formal-study static set keeps the original core attributes and adds 20 more interpretable variables covering:
+
+- hydrologic distribution (`Q50`, `Qstd`, `Q10`)
+- climate distribution (`P50`, `P95`, `PEstd`)
+- vegetation and biomass (`LAIstd`, `agBiomass`)
+- irrigation and managed water use (`iaFmean`, `IWUmean`, `IWU_SI`)
+- reservoir / public supply water management (`RS_mean`, `RS_std`, `PSW_SW_mean`, `PSW_SW_si`, `PSW_GW_mean`, `PSW_GW_si`)
+- soil retention and texture (`Wsat`, `WPnt`, `vf_clay_s`)
+
+This choice intentionally favors variables that are both predictive in the current station-level screening and easy to explain in the final paper. Highly redundant alternatives are still excluded for now.
+
+
+## Dynamic temperature feature update (2026-03-23)
+
+The active experiment configs now keep `tmin` and `tmax` but remove `air_temp` from the default dynamic feature set. This keeps the temperature block easier to interpret and avoids sending a direct linear combination of the same day-level temperature signal into the main model by default.
+
+
+## Model-frame optimization update (2026-03-23)
+
+After the full-data formal run successfully built source-level parquet caches, the next failure point was traced to feature construction rather than raw file ingestion. The `build_model_frame` path is now being refactored toward batched lag/rolling feature assembly with more explicit logging so that the true post-cache bottleneck can be measured on the next rerun.
+
+## Post-audit experiment restructuring update (2026-03-23)
+
+The project has now moved from a generic joint formal setup toward a more defensible split between:
+
+- a conductance-first formal line, and
+- a separate turbidity pilot line
+
+Three implementation changes matter here:
+
+1. WQ cache cleanup
+- the bundle loader now drops rows whose configured targets are all missing before writing `wq_observations.parquet`
+- this directly follows the audit finding that the previous WQ cache kept too many structurally useless rows
+
+2. Active removal of `lai` / `swe` from the main bundle configs
+- `lai` and `swe` have been removed from the active dynamic feature lists
+- `LAImean`, `LAIstd`, and `SWEmean` were also removed from the active static lists
+- the current graph similarity feature set no longer uses `SWEmean`
+
+3. Config split for the next study round
+- `configs/dataset_bundle_linux_formal_conductance.yaml`
+  - the next main formal configuration
+  - conductance only
+  - torch only
+- `configs/dataset_bundle_linux_turbidity_later_era_pilot.yaml`
+  - a separate later-era turbidity pilot
+  - date-filtered from `2000-01-01`
+
+This restructuring is meant to keep the main paper line aligned with the most stable target first, while still preserving a clear path to a later sparse-target turbidity study.

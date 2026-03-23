@@ -1,4 +1,4 @@
-﻿# HydroTail Experiment Setup
+# HydroTail Experiment Setup
 
 ## 1. Available configs
 
@@ -9,18 +9,23 @@ Use one of these configs depending on your data source:
   - useful for smoke tests and manually prepared tabular data
 - `configs/dataset_bundle_experiment.yaml`
   - reads the current folder-style dataset under `dataset/`
+  - also supports separately configured roots for `attributes`, `time series`, and `WQ`
   - useful for the real multi-file station dataset
 
 ## 2. Dataset bundle layout
 
-The folder-style loader expects:
+The folder-style loader supports two ways to locate data:
 
-- `dataset/attritubes/*.xlsx` or `dataset/attributes/*.xlsx`
-- `dataset/time series/<source folder>/<station file>.csv`
-- water-quality targets in one of these routes:
-  - `dataset/WQ/SEC/*.csv` and `dataset/WQ/Tur/*.csv`
-  - `dataset/WQ/wq_observations.csv`
-  - legacy folders such as `dataset/WQ/Paired_EC/*` and `dataset/WQ/Paired_Tur/*`
+1. one shared `dataset_root`
+   - `dataset/attritubes/*.xlsx` or `dataset/attributes/*.xlsx`
+   - `dataset/time series/<source folder>/<station file>.csv`
+   - `dataset/WQ/SEC/*.csv`, `dataset/WQ/Tur/*.csv`, or `dataset/WQ/wq_observations.csv`
+2. separate component roots in config
+   - `paths.attributes_root`
+   - `paths.time_series_root`
+   - `paths.wq_root`
+
+If a component-specific root is configured, it takes precedence over the matching subfolder under `dataset_root`.
 
 Current supported time-series source folders in `configs/dataset_bundle_experiment.yaml`:
 
@@ -31,6 +36,16 @@ Current supported time-series source folders in `configs/dataset_bundle_experime
 - `SWE_SNODAS`
 
 These are merged by station and date into one dynamic table.
+
+Example config:
+
+```yaml
+paths:
+  dataset_root: dataset
+  attributes_root: 'F:\\jupyter_notebook\\wat_quality_pred\\dataset\\attritubes'
+  time_series_root: 'F:\\jupyter_notebook\\baseflow_predict\\dataset\\time_series'
+  wq_root: 'F:\\jupyter_notebook\\wat_quality_pred\\dataset\\WQ'
+```
 
 ## 3. Water-quality target loading
 
@@ -176,6 +191,13 @@ models:
     graph_backend: gnn
 ```
 
+Every experiment run now also saves a config snapshot to the matching output folders:
+
+- `outputs/<run_name>/experiment_config.yaml`
+- `outputs/<run_name>/horizon_<k>/experiment_config.yaml`
+
+This preserves the exact YAML used for that run and makes later result tracing easier.
+
 ## 10. Smoke test
 
 Use:
@@ -199,3 +221,189 @@ This checks:
 - sequence models
 - both graph-backend modes in tabular and sequence routes
 - extra period-slice analysis outputs
+
+
+
+## 11. Parquet cache, downcast, and coverage-aware smoke subset
+
+The folder-style dataset loader now supports three additional controls:
+
+- `data.downcast_float32`
+  - when enabled, numeric columns are downcast to `float32` after bundle loading and again after feature construction
+  - this reduces memory pressure for sparse station-day tables with many lag and rolling features
+- `data.dataset_bundle.use_parquet_cache`
+  - when enabled, the bundle loader writes component-level caches for:
+    - `attributes.parquet`
+    - `time_series.parquet`
+    - `wq_observations.parquet`
+  - cache files are stored under `<dataset_root>/_hydrotail_cache/<namespace>/`
+  - each namespace also writes `metadata.json`
+- `data.dataset_bundle.station_selection_strategy`
+  - when `station_limit` is set, the loader can now pick a coverage-aware smoke subset instead of taking the first N stations
+  - current supported values:
+    - `coverage_aware`
+    - fallback non-coverage mode for deterministic first-N selection
+
+Recommended smoke-specific controls:
+
+```yaml
+data:
+  downcast_float32: true
+  dataset_bundle:
+    use_parquet_cache: true
+    refresh_cache: false
+    station_limit: 32
+    station_selection_strategy: coverage_aware
+    coverage_min_stations_per_target: 12
+```
+
+Notes:
+
+- `refresh_cache: false` reuses existing parquet caches for repeated smoke runs on the same data/config namespace.
+- If you change the source roots or the smoke-subset specification, a new cache namespace will be created automatically.
+- If the raw files under the same paths are modified in place, set `refresh_cache: true` once to rebuild the cache.
+
+## 12. Sparse-target smoke validation on Linux
+
+The Linux smoke config `configs/dataset_bundle_linux_smoke.yaml` is now intentionally different from the main experiment config in one place:
+
+- smoke uses `splits.strategy: unseen_station`
+- the main experiment still uses `splits.strategy: unseen_station_and_future`
+
+Reason:
+
+- for sparse targets such as `turbidity`, the stricter spatiotemporal split can remove a target entirely from the train partition on a small smoke subset, even when the selected stations do contain that target overall
+- `unseen_station` is therefore the safer smoke setting when the goal is to validate the end-to-end pipeline rather than reproduce the final research split
+
+Observed Linux server behavior after this change:
+
+- cold cache build still spends most of its time on first-pass file parsing and merged-table construction
+- warm cache reuse reduces dataset loading from minutes to well under one second on the 32-station smoke subset
+- the coverage-aware subset now loads both `conductance` and `turbidity` files for the smoke run
+
+Update (2026-03-23, fast smoke mode):
+
+- the Linux smoke config is now intentionally reduced to `models: [torch_tail]`
+- reason: `linear_tail` and `gbdt_tail` are CPU baselines and can dominate wall-clock time on the current smoke subset even after parquet caching is enabled
+- this keeps smoke focused on end-to-end validation of the main GPU-backed route
+- if baseline comparison is needed, run a separate baseline config rather than mixing it into the fast smoke check
+
+- the fast Linux smoke output directory now uses a dedicated path for torch-only validation so its artifacts do not mix with earlier baseline-heavy smoke runs
+
+## 13. Formal static feature set (2026-03-23)
+
+The formal experiment configs now use an expanded static feature set instead of the earlier 15-column core-only version.
+
+Core 15 retained:
+
+- `latitude`
+- `longitude`
+- `watershed_area`
+- `DEMmean`
+- `DROPmean`
+- `DEMstd`
+- `permeability`
+- `porosity`
+- `ksat`
+- `prcp_yearly_mean`
+- `PE_yearly_mean`
+- `LAImean`
+- `Qmean`
+- `SWEmean`
+- `population`
+
+Newly added for the formal study:
+
+- hydrologic distribution:
+  - `Q50`
+  - `Qstd`
+  - `Q10`
+- climate distribution:
+  - `P50`
+  - `P95`
+  - `PEstd`
+- vegetation / biomass:
+  - `LAIstd`
+  - `agBiomass`
+- irrigation / managed water use:
+  - `iaFmean`
+  - `IWUmean`
+  - `IWU_SI`
+- reservoir / public supply water:
+  - `RS_mean`
+  - `RS_std`
+  - `PSW_SW_mean`
+  - `PSW_SW_si`
+  - `PSW_GW_mean`
+  - `PSW_GW_si`
+- soil water retention / texture:
+  - `Wsat`
+  - `WPnt`
+  - `vf_clay_s`
+
+Selection rule used here:
+
+- keep the original core set for comparability
+- add attributes with both:
+  - meaningful station-level correlation to water-quality summaries, and
+  - clear physical interpretation for the paper narrative
+- avoid adding obviously redundant alternatives such as:
+  - `bgBiomass`
+  - `Q30`
+  - `P5`
+  - `PE50`
+  - `PSW_*_std`
+  - `IWUstd`
+
+At this stage the graph similarity feature set is intentionally left unchanged. The expanded attributes are first used as static predictors; whether they should also enter graph construction can be treated as a later ablation.
+
+
+## 14. Temperature feature cleanup (2026-03-23)
+
+To avoid redundant temperature predictors in the main experiments:
+
+- `air_temp` has been removed from the active bundle-based dynamic feature lists
+- active Linux formal and smoke configs now keep `tmin` and `tmax` only
+- the bundle loader will derive `air_temp` only when a future config explicitly requests it
+
+
+## 15. Model-frame performance fix (2026-03-23)
+
+The full Linux formal run no longer fails in the raw-data ingestion stage. The new bottleneck was identified inside `build_model_frame`, where lag and rolling features were inserted column-by-column into a very large pandas DataFrame.
+
+The current implementation now:
+
+- assembles temporal features in batches instead of repeated `frame[col] = ...` insertion
+- logs the major model-frame stages (`daily frame`, `target-eligible rows`, per-series temporal feature progress, post-merge row counts)
+- keeps the existing source-level parquet cache so formal reruns reuse `attributes`, `time_series`, and `wq_observations` directly
+
+This update is meant to reduce DataFrame fragmentation and make the next server rerun observable enough to diagnose any remaining bottleneck.
+
+
+## 16. WQ cache cleanup and config split update (2026-03-23)
+
+The bundle loader now drops any WQ row whose configured targets are all missing before writing the component parquet cache.
+
+Why this was added:
+
+- the data audit showed that `wq_observations.parquet` previously contained a very large number of rows where both targets were `NaN`
+- those rows add storage and alignment cost but provide no learning signal
+- the cache namespace schema version has therefore been bumped so future bundle caches are rebuilt with the cleaned WQ rule
+
+At the same time, the active bundle-based configs were simplified:
+
+- `lai` and `swe` are removed from the dynamic feature lists
+- `LAImean`, `LAIstd`, and `SWEmean` are removed from the active static feature lists
+- `SWEmean` is also removed from the current graph similarity feature list
+
+Two new Linux configs were added:
+
+- `configs/dataset_bundle_linux_formal_conductance.yaml`
+  - conductance-only formal run
+  - no `lai/swe`
+  - torch-only
+- `configs/dataset_bundle_linux_turbidity_later_era_pilot.yaml`
+  - turbidity-only pilot run
+  - no `lai/swe`
+  - date filter starts at `2000-01-01`
+  - uses a later-era split to avoid the previous turbidity train-collapse

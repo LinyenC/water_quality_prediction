@@ -15,6 +15,19 @@ from hydrotail.data import SequenceSamples
 from hydrotail.models.graph_backends import GraphBackbone, build_neighbor_map
 
 
+def _resolve_device(device_value: object) -> torch.device:
+    """Resolve a user-facing device config into a concrete torch device."""
+
+    device_text = str(device_value or "auto").strip().lower()
+    if device_text == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    device = torch.device(str(device_value))
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"CUDA device `{device}` was requested but torch.cuda.is_available() is False.")
+    return device
+
+
 def _quantile_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -399,6 +412,7 @@ class SequenceTailModel:
         self.graph_backend = str(self.model_cfg.get("graph_backend", "neighbor_stats")).lower()
         if self.graph_backend not in {"none", "neighbor_stats", "gnn"}:
             raise ValueError(f"Unsupported graph_backend: {self.graph_backend}")
+        self.device = _resolve_device(self.model_cfg.get("device", "auto"))
 
         self.target_names: list[str] = []
         self.dynamic_medians: np.ndarray | None = None
@@ -499,8 +513,8 @@ class SequenceTailModel:
             ]
         ).astype(np.float32)
 
-        quantiles_tensor = torch.tensor(self.quantiles, dtype=torch.float32)
-        quantile_weight_tensor = torch.tensor(self.quantile_weights, dtype=torch.float32)
+        quantiles_tensor = torch.tensor(self.quantiles, dtype=torch.float32, device=self.device)
+        quantile_weight_tensor = torch.tensor(self.quantile_weights, dtype=torch.float32, device=self.device)
 
         if self.graph_backend == "gnn":
             self._fit_with_gnn_backend(
@@ -553,6 +567,7 @@ class SequenceTailModel:
         quantile_weight_tensor: torch.Tensor,
         sample_weight: np.ndarray | None,
     ) -> None:
+        pin_memory = self.device.type == "cuda"
         train_dataset = TensorDataset(
             torch.tensor(train_values),
             torch.tensor(train_masks),
@@ -568,7 +583,12 @@ class SequenceTailModel:
             num_samples=len(sample_weight),
             replacement=True,
         )
-        loader = DataLoader(train_dataset, batch_size=int(self.model_cfg.get("batch_size", 128)), sampler=sampler)
+        loader = DataLoader(
+            train_dataset,
+            batch_size=int(self.model_cfg.get("batch_size", 128)),
+            sampler=sampler,
+            pin_memory=pin_memory,
+        )
 
         hidden_dim = int(self.model_cfg.get("hidden_dim", 64))
         self.model = SequenceDenseTailNet(
@@ -580,7 +600,7 @@ class SequenceTailModel:
             target_names=self.target_names,
             quantiles=self.quantiles,
             model_cfg=self.model_cfg,
-        )
+        ).to(self.device)
         optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=float(self.model_cfg.get("learning_rate", 1e-3)),
@@ -603,9 +623,14 @@ class SequenceTailModel:
         for _epoch in range(int(self.model_cfg.get("epochs", 20))):
             self.model.train()
             for batch_values, batch_masks, batch_static, batch_targets, batch_events in loader:
+                batch_values = batch_values.to(self.device, non_blocking=pin_memory)
+                batch_masks = batch_masks.to(self.device, non_blocking=pin_memory)
+                batch_static = batch_static.to(self.device, non_blocking=pin_memory)
+                batch_targets = batch_targets.to(self.device, non_blocking=pin_memory)
+                batch_events = batch_events.to(self.device, non_blocking=pin_memory)
                 optimizer.zero_grad()
                 outputs = self.model(batch_values, batch_masks, batch_static)
-                total_loss = torch.tensor(0.0, dtype=torch.float32)
+                total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.device)
                 for target_idx, target_name in enumerate(self.target_names):
                     valid_mask = torch.isfinite(batch_targets[:, target_idx])
                     quantile_pred = outputs[target_name]["quantiles"]
@@ -725,7 +750,7 @@ class SequenceTailModel:
             target_names=self.target_names,
             quantiles=self.quantiles,
             model_cfg=self.model_cfg,
-        )
+        ).to(self.device)
         optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=float(self.model_cfg.get("learning_rate", 1e-3)),
@@ -766,6 +791,11 @@ class SequenceTailModel:
     ) -> float:
         assert self.model is not None
         values, masks, static_values, targets, events = valid_tensors
+        values = values.to(self.device)
+        masks = masks.to(self.device)
+        static_values = static_values.to(self.device)
+        targets = targets.to(self.device)
+        events = events.to(self.device)
         with torch.no_grad():
             outputs = self.model(values, masks, static_values)
             total_loss = 0.0
@@ -800,16 +830,16 @@ class SequenceTailModel:
         assert snapshot.events is not None
         assert snapshot.row_weight is not None
 
-        sequence_values = torch.tensor(snapshot.sequence_values, dtype=torch.float32)
-        sequence_masks = torch.tensor(snapshot.sequence_masks, dtype=torch.float32)
-        static_values = torch.tensor(snapshot.static_values, dtype=torch.float32)
-        adjacency = torch.tensor(snapshot.adjacency, dtype=torch.float32)
-        targets = torch.tensor(snapshot.targets, dtype=torch.float32)
-        events = torch.tensor(snapshot.events, dtype=torch.float32)
-        row_weight = torch.tensor(snapshot.row_weight, dtype=torch.float32)
+        sequence_values = torch.tensor(snapshot.sequence_values, dtype=torch.float32, device=self.device)
+        sequence_masks = torch.tensor(snapshot.sequence_masks, dtype=torch.float32, device=self.device)
+        static_values = torch.tensor(snapshot.static_values, dtype=torch.float32, device=self.device)
+        adjacency = torch.tensor(snapshot.adjacency, dtype=torch.float32, device=self.device)
+        targets = torch.tensor(snapshot.targets, dtype=torch.float32, device=self.device)
+        events = torch.tensor(snapshot.events, dtype=torch.float32, device=self.device)
+        row_weight = torch.tensor(snapshot.row_weight, dtype=torch.float32, device=self.device)
         outputs = self.model(sequence_values, sequence_masks, static_values, adjacency)
 
-        total_loss = torch.tensor(0.0, dtype=torch.float32)
+        total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.device)
         for target_idx, target_name in enumerate(self.target_names):
             valid_mask = torch.isfinite(targets[:, target_idx])
             quantile_pred = outputs[target_name]["quantiles"]
@@ -865,19 +895,21 @@ class SequenceTailModel:
 
         with torch.no_grad():
             outputs = self.model(
-                torch.tensor(sequence_values),
-                torch.tensor(sequence_masks),
-                torch.tensor(static_values),
+                torch.tensor(sequence_values, device=self.device),
+                torch.tensor(sequence_masks, device=self.device),
+                torch.tensor(static_values, device=self.device),
             )
 
         predictions = self._empty_predictions(len(bundle.frame))
         for target_name in self.target_names:
-            quantile_matrix = outputs[target_name]["quantiles"].numpy()
+            quantile_matrix = outputs[target_name]["quantiles"].detach().cpu().numpy()
             predictions[target_name]["point"] = quantile_matrix[:, self.point_quantile_index]
             predictions[target_name]["quantiles"] = {
                 quantile: quantile_matrix[:, idx] for idx, quantile in enumerate(self.quantiles)
             }
-            predictions[target_name]["exceedance_probability"] = torch.sigmoid(outputs[target_name]["logit"]).numpy()
+            predictions[target_name]["exceedance_probability"] = (
+                torch.sigmoid(outputs[target_name]["logit"]).detach().cpu().numpy()
+            )
         return predictions
 
     def _predict_with_gnn_backend(
@@ -903,18 +935,18 @@ class SequenceTailModel:
         with torch.no_grad():
             for snapshot in snapshots:
                 outputs = self.model(
-                    torch.tensor(snapshot.sequence_values, dtype=torch.float32),
-                    torch.tensor(snapshot.sequence_masks, dtype=torch.float32),
-                    torch.tensor(snapshot.static_values, dtype=torch.float32),
-                    torch.tensor(snapshot.adjacency, dtype=torch.float32),
+                    torch.tensor(snapshot.sequence_values, dtype=torch.float32, device=self.device),
+                    torch.tensor(snapshot.sequence_masks, dtype=torch.float32, device=self.device),
+                    torch.tensor(snapshot.static_values, dtype=torch.float32, device=self.device),
+                    torch.tensor(snapshot.adjacency, dtype=torch.float32, device=self.device),
                 )
                 for target_name in self.target_names:
-                    quantile_matrix = outputs[target_name]["quantiles"].numpy()
+                    quantile_matrix = outputs[target_name]["quantiles"].detach().cpu().numpy()
                     predictions[target_name]["point"][snapshot.row_indices] = quantile_matrix[:, self.point_quantile_index]
                     for idx, quantile in enumerate(self.quantiles):
                         predictions[target_name]["quantiles"][quantile][snapshot.row_indices] = quantile_matrix[:, idx]
                     predictions[target_name]["exceedance_probability"][snapshot.row_indices] = (
-                        torch.sigmoid(outputs[target_name]["logit"]).numpy()
+                        torch.sigmoid(outputs[target_name]["logit"]).detach().cpu().numpy()
                     )
 
         return predictions

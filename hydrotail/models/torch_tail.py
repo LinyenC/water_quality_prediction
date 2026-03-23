@@ -14,6 +14,19 @@ from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 from hydrotail.models.graph_backends import GraphBackbone, GraphSnapshot, build_graph_snapshots, build_neighbor_map
 
 
+def _resolve_device(device_value: object) -> torch.device:
+    """Resolve a user-facing device config into a concrete torch device."""
+
+    device_text = str(device_value or "auto").strip().lower()
+    if device_text == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    device = torch.device(str(device_value))
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"CUDA device `{device}` was requested but torch.cuda.is_available() is False.")
+    return device
+
+
 def _quantile_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -151,6 +164,7 @@ class TorchTailModel:
         self.graph_backend = str(self.model_cfg.get("graph_backend", "neighbor_stats")).lower()
         if self.graph_backend not in {"none", "neighbor_stats", "gnn"}:
             raise ValueError(f"Unsupported graph_backend: {self.graph_backend}")
+        self.device = _resolve_device(self.model_cfg.get("device", "auto"))
 
         self.imputer = SimpleImputer(strategy="median")
         self.scaler = StandardScaler()
@@ -216,8 +230,8 @@ class TorchTailModel:
             ]
         )
 
-        quantiles_tensor = torch.tensor(self.quantiles, dtype=torch.float32)
-        quantile_weight_tensor = torch.tensor(self.quantile_weights, dtype=torch.float32)
+        quantiles_tensor = torch.tensor(self.quantiles, dtype=torch.float32, device=self.device)
+        quantile_weight_tensor = torch.tensor(self.quantile_weights, dtype=torch.float32, device=self.device)
 
         if self.graph_backend == "gnn":
             self._fit_with_gnn_backend(
@@ -258,6 +272,7 @@ class TorchTailModel:
         quantile_weight_tensor: torch.Tensor,
         sample_weight: np.ndarray | None,
     ) -> None:
+        pin_memory = self.device.type == "cuda"
         dataset = TensorDataset(
             torch.tensor(x_train, dtype=torch.float32),
             torch.tensor(y_train, dtype=torch.float32),
@@ -270,7 +285,12 @@ class TorchTailModel:
             num_samples=len(sample_weight),
             replacement=True,
         )
-        loader = DataLoader(dataset, batch_size=int(self.model_cfg.get("batch_size", 256)), sampler=sampler)
+        loader = DataLoader(
+            dataset,
+            batch_size=int(self.model_cfg.get("batch_size", 256)),
+            sampler=sampler,
+            pin_memory=pin_memory,
+        )
 
         self.model = MultiTaskTailNet(
             input_dim=x_train.shape[1],
@@ -278,7 +298,7 @@ class TorchTailModel:
             dropout=float(self.model_cfg.get("dropout", 0.1)),
             target_names=self.target_names,
             quantiles=self.quantiles,
-        )
+        ).to(self.device)
         optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=float(self.model_cfg.get("learning_rate", 1e-3)),
@@ -298,9 +318,12 @@ class TorchTailModel:
         for _epoch in range(int(self.model_cfg.get("epochs", 25))):
             self.model.train()
             for batch_x, batch_y, batch_e in loader:
+                batch_x = batch_x.to(self.device, non_blocking=pin_memory)
+                batch_y = batch_y.to(self.device, non_blocking=pin_memory)
+                batch_e = batch_e.to(self.device, non_blocking=pin_memory)
                 optimizer.zero_grad()
                 outputs = self.model(batch_x)
-                total_loss = torch.tensor(0.0, dtype=torch.float32)
+                total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.device)
                 for target_idx, target_name in enumerate(self.target_names):
                     valid_mask = torch.isfinite(batch_y[:, target_idx])
                     quantile_pred = outputs[target_name]["quantiles"]
@@ -390,7 +413,7 @@ class TorchTailModel:
             dropout=dropout,
             target_names=self.target_names,
             quantiles=self.quantiles,
-        )
+        ).to(self.device)
         optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=float(self.model_cfg.get("learning_rate", 1e-3)),
@@ -430,6 +453,9 @@ class TorchTailModel:
     ) -> float:
         assert self.model is not None
         features, targets, events = valid_tensors
+        features = features.to(self.device)
+        targets = targets.to(self.device)
+        events = events.to(self.device)
         with torch.no_grad():
             outputs = self.model(features)
             total_loss = 0.0
@@ -464,14 +490,14 @@ class TorchTailModel:
         assert snapshot.events is not None
         assert snapshot.row_weight is not None
 
-        features = torch.tensor(snapshot.features, dtype=torch.float32)
-        adjacency = torch.tensor(snapshot.adjacency, dtype=torch.float32)
-        targets = torch.tensor(snapshot.targets, dtype=torch.float32)
-        events = torch.tensor(snapshot.events, dtype=torch.float32)
-        row_weight = torch.tensor(snapshot.row_weight, dtype=torch.float32)
+        features = torch.tensor(snapshot.features, dtype=torch.float32, device=self.device)
+        adjacency = torch.tensor(snapshot.adjacency, dtype=torch.float32, device=self.device)
+        targets = torch.tensor(snapshot.targets, dtype=torch.float32, device=self.device)
+        events = torch.tensor(snapshot.events, dtype=torch.float32, device=self.device)
+        row_weight = torch.tensor(snapshot.row_weight, dtype=torch.float32, device=self.device)
         outputs = self.model(features, adjacency)
 
-        total_loss = torch.tensor(0.0, dtype=torch.float32)
+        total_loss = torch.tensor(0.0, dtype=torch.float32, device=self.device)
         for target_idx, target_name in enumerate(self.target_names):
             valid_mask = torch.isfinite(targets[:, target_idx])
             quantile_pred = outputs[target_name]["quantiles"]
@@ -529,16 +555,18 @@ class TorchTailModel:
             return self._predict_with_gnn_backend(frame, x)
 
         with torch.no_grad():
-            outputs = self.model(torch.tensor(x, dtype=torch.float32))
+            outputs = self.model(torch.tensor(x, dtype=torch.float32, device=self.device))
 
         predictions = self._empty_predictions(len(frame))
         for target_name in self.target_names:
-            quantile_matrix = outputs[target_name]["quantiles"].numpy()
+            quantile_matrix = outputs[target_name]["quantiles"].detach().cpu().numpy()
             predictions[target_name]["point"] = quantile_matrix[:, self.point_quantile_index]
             predictions[target_name]["quantiles"] = {
                 quantile: quantile_matrix[:, idx] for idx, quantile in enumerate(self.quantiles)
             }
-            predictions[target_name]["exceedance_probability"] = torch.sigmoid(outputs[target_name]["logit"]).numpy()
+            predictions[target_name]["exceedance_probability"] = (
+                torch.sigmoid(outputs[target_name]["logit"]).detach().cpu().numpy()
+            )
         return predictions
 
     def _predict_with_gnn_backend(self, frame: pd.DataFrame, feature_array: np.ndarray) -> dict[str, dict[str, object]]:
@@ -556,16 +584,16 @@ class TorchTailModel:
         with torch.no_grad():
             for snapshot in snapshots:
                 outputs = self.model(
-                    torch.tensor(snapshot.features, dtype=torch.float32),
-                    torch.tensor(snapshot.adjacency, dtype=torch.float32),
+                    torch.tensor(snapshot.features, dtype=torch.float32, device=self.device),
+                    torch.tensor(snapshot.adjacency, dtype=torch.float32, device=self.device),
                 )
                 for target_name in self.target_names:
-                    quantile_matrix = outputs[target_name]["quantiles"].numpy()
+                    quantile_matrix = outputs[target_name]["quantiles"].detach().cpu().numpy()
                     predictions[target_name]["point"][snapshot.row_indices] = quantile_matrix[:, self.point_quantile_index]
                     for idx, quantile in enumerate(self.quantiles):
                         predictions[target_name]["quantiles"][quantile][snapshot.row_indices] = quantile_matrix[:, idx]
                     predictions[target_name]["exceedance_probability"][snapshot.row_indices] = (
-                        torch.sigmoid(outputs[target_name]["logit"]).numpy()
+                        torch.sigmoid(outputs[target_name]["logit"]).detach().cpu().numpy()
                     )
 
         return predictions
@@ -573,3 +601,4 @@ class TorchTailModel:
     def save(self, path: str | Path) -> None:
         with Path(path).open("wb") as handle:
             torch.save(self, handle)
+

@@ -1,0 +1,181 @@
+﻿project:
+  name: hydrotail_linux_smoke
+
+paths:
+  dataset_root: /data/data2/linyen3/wat_quality_pred/dataset
+  output_dir: /data/data2/linyen3/wat_quality_pred/outputs/dataset_bundle_smoke_torch_run
+
+data:
+  station_col: station_id
+  station_id_width: 8
+  date_col: date
+  time_frequency: D
+  downcast_float32: true
+  targets:
+    conductance: specific_conductance
+    turbidity: turbidity
+  dynamic_features:
+    - discharge
+    - precip
+    - tmin
+    - tmax
+    - pe
+  static_features:
+    - latitude
+    - longitude
+    - watershed_area
+    - DEMmean
+    - DROPmean
+    - DEMstd
+    - permeability
+    - porosity
+    - ksat
+    - prcp_yearly_mean
+    - PE_yearly_mean
+    - Qmean
+    - population
+  dataset_bundle:
+    use_parquet_cache: true
+    refresh_cache: false
+    drop_all_null_target_rows: true
+    station_limit: 32
+    station_selection_strategy: coverage_aware
+    coverage_min_stations_per_target: 12
+    attributes_dir_candidates:
+      - attritubes
+      - attributes
+    attributes_patterns:
+      - "*.xlsx"
+      - "*.csv"
+    attributes_station_col: gauge_id
+    attributes_rename_map:
+      gauge_id: station_id
+      Lat: latitude
+      Lon: longitude
+      Area: watershed_area
+      Ksat: ksat
+    time_series_dir_candidates:
+      - time series
+      - time_series
+    time_series_sources:
+      - folder: streamflow
+        pattern: "*_streamflow.csv"
+        rename_map:
+          Qobs(m3/s): discharge
+      - folder: daymet
+        pattern: "*_forcing.csv"
+        rename_map:
+          Prec: precip
+          Tmin: tmin
+          Tmax: tmax
+      - folder: PE
+        pattern: "*_forcing.csv"
+        rename_map:
+          PE: pe
+    wq_dir_candidates:
+      - WQ
+      - wq
+    wq_cache_name: wq_observations.csv
+    wq_sources:
+      conductance:
+        folder_candidates:
+          - SEC
+          - Paired_EC
+        pattern: "*"
+        source_value_col: EC
+        date_column: Date
+      turbidity:
+        folder_candidates:
+          - Tur
+          - Paired_Tur
+        pattern: "*"
+        source_value_col: Tur
+        date_column: Date
+
+features:
+  horizons:
+    - 1
+  lags:
+    - 1
+    - 3
+    - 7
+  rolling_windows:
+    - 3
+    - 7
+  add_seasonal: true
+  min_non_null_feature_ratio: 0.2
+
+sequence:
+  lookback_window: 30
+  min_history_ratio: 0.15
+
+graph:
+  enabled: true
+  k_neighbors: 3
+  feature_columns:
+    - watershed_area
+    - DEMmean
+    - DROPmean
+    - ksat
+    - prcp_yearly_mean
+    - Qmean
+
+splits:
+  strategy: unseen_station
+  seed: 42
+  train_station_fraction: 0.6
+  valid_station_fraction: 0.2
+  test_station_fraction: 0.2
+  train_time_fraction: 0.6
+  valid_time_fraction: 0.2
+
+tail:
+  exceedance_quantiles:
+    conductance: 0.95
+    turbidity: 0.9
+  quantiles:
+    - 0.1
+    - 0.5
+    - 0.9
+    - 0.95
+    - 0.99
+  quantile_weights:
+    - 1.0
+    - 1.0
+    - 1.5
+    - 2.0
+    - 2.5
+  tail_weight_multiplier: 4.0
+
+run:
+  models:
+    - torch_tail
+
+models:
+  linear_tail:
+    alpha: 0.01
+    max_iter: 500
+  gbdt_tail:
+    n_estimators: 50
+    max_depth: 3
+    learning_rate: 0.05
+    min_samples_leaf: 10
+  torch_tail:
+    device: cuda:0
+    graph_backend: neighbor_stats
+    hidden_dims:
+      - 64
+      - 32
+    dropout: 0.1
+    batch_size: 128
+    epochs: 3
+    patience: 2
+    learning_rate: 0.001
+    weight_decay: 0.0001
+    gnn:
+      hidden_dim: 32
+      num_layers: 2
+      dropout: 0.1
+
+
+

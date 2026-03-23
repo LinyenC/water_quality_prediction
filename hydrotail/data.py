@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -7,8 +8,12 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from hydrotail.bundle_cache import downcast_numeric_frame
 from hydrotail.dataset_bundle import load_dataset_bundle
 from hydrotail.graph import build_similarity_outputs
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -65,6 +70,22 @@ def _first_non_null(series: pd.Series):
     return non_null.iloc[0]
 
 
+def _downcast_enabled(config: dict[str, object]) -> bool:
+    data_cfg = config.get("data", {})
+    bundle_cfg = data_cfg.get("dataset_bundle", {})
+    return bool(data_cfg.get("downcast_float32", bundle_cfg.get("downcast_float32", True)))
+
+
+def _maybe_downcast_frame(
+    frame: pd.DataFrame,
+    config: dict[str, object],
+    exclude_cols: Iterable[str],
+) -> pd.DataFrame:
+    if not _downcast_enabled(config):
+        return frame
+    return downcast_numeric_frame(frame, exclude_cols=exclude_cols)
+
+
 def _collapse_duplicate_station_days(frame: pd.DataFrame, station_col: str, date_col: str) -> pd.DataFrame:
     """Collapse duplicate rows within the same station-day before daily alignment."""
 
@@ -74,6 +95,45 @@ def _collapse_duplicate_station_days(frame: pd.DataFrame, station_col: str, date
     for col in other_cols:
         aggregations[col] = _first_non_null
     return frame.groupby([station_col, date_col], as_index=False).agg(aggregations)
+
+
+def _apply_dynamic_date_filter(dynamic_df: pd.DataFrame, config: dict[str, object]) -> pd.DataFrame:
+    data_cfg = config.get("data", {})
+    date_filter_cfg = data_cfg.get("date_filter", {})
+    if not date_filter_cfg:
+        return dynamic_df
+
+    station_col = data_cfg["station_col"]
+    date_col = data_cfg["date_col"]
+    start_date = date_filter_cfg.get("start_date")
+    end_date = date_filter_cfg.get("end_date")
+    if not start_date and not end_date:
+        return dynamic_df
+
+    result = dynamic_df.copy()
+    result[date_col] = pd.to_datetime(result[date_col], errors="coerce")
+    mask = result[date_col].notna()
+    if start_date:
+        start_ts = pd.Timestamp(start_date)
+        mask &= result[date_col] >= start_ts
+    else:
+        start_ts = None
+    if end_date:
+        end_ts = pd.Timestamp(end_date)
+        mask &= result[date_col] <= end_ts
+    else:
+        end_ts = None
+
+    filtered = result.loc[mask].reset_index(drop=True)
+    LOGGER.info(
+        "Applied dynamic date filter: start_date=%s end_date=%s rows_before=%s rows_after=%s stations_after=%s",
+        start_ts,
+        end_ts,
+        len(dynamic_df),
+        len(filtered),
+        filtered[station_col].nunique() if not filtered.empty else 0,
+    )
+    return filtered
 
 
 def _align_to_daily_grid(frame: pd.DataFrame, station_col: str, date_col: str, freq: str = "D") -> pd.DataFrame:
@@ -93,7 +153,9 @@ def _align_to_daily_grid(frame: pd.DataFrame, station_col: str, date_col: str, f
 
 
 def load_datasets(config: dict[str, object]) -> tuple[pd.DataFrame, pd.DataFrame | None]:
-    if config.get("paths", {}).get("dataset_root"):
+    paths_cfg = config.get("paths", {})
+    bundle_keys = ("dataset_root", "attributes_root", "time_series_root", "wq_root")
+    if any(paths_cfg.get(key) for key in bundle_keys):
         dynamic_df, static_df = load_dataset_bundle(config)
         return dynamic_df, static_df
 
@@ -112,6 +174,9 @@ def load_datasets(config: dict[str, object]) -> tuple[pd.DataFrame, pd.DataFrame
     _ensure_columns(dynamic_df, dynamic_required, "dynamic data")
     if static_df is not None:
         _ensure_columns(static_df, [station_col], "static data")
+        static_df = _maybe_downcast_frame(static_df, config, exclude_cols=(station_col,))
+    dynamic_df = _apply_dynamic_date_filter(dynamic_df, config)
+    dynamic_df = _maybe_downcast_frame(dynamic_df, config, exclude_cols=(station_col, date_col))
     return dynamic_df, static_df
 
 
@@ -131,11 +196,75 @@ def _prepare_daily_frame(dynamic_df: pd.DataFrame, config: dict[str, object]) ->
     frame = _align_to_daily_grid(frame, station_col=station_col, date_col=date_col, freq=str(config.get("data", {}).get("time_frequency", "D")))
     frame = frame.sort_values([station_col, date_col]).reset_index(drop=True)
 
-    # Keep explicit missingness flags so models can distinguish "not observed" from true low values.
     for col in raw_series_cols:
         frame[f"{col}_observed"] = frame[col].notna().astype(float)
     frame["any_dynamic_observed"] = frame[raw_series_cols].notna().any(axis=1).astype(float)
+    frame = _maybe_downcast_frame(frame, config, exclude_cols=(station_col, date_col))
     return frame, raw_series_cols
+
+
+def _build_target_frame(
+    frame: pd.DataFrame,
+    grouped,
+    target_map: dict[str, str],
+    horizon: int,
+) -> tuple[pd.DataFrame, dict[str, str], pd.Series]:
+    target_data: dict[str, pd.Series] = {}
+    target_cols: dict[str, str] = {}
+    for target_name, source_col in target_map.items():
+        target_col = f"target_{target_name}_h{horizon}"
+        target_data[target_col] = grouped[source_col].shift(-horizon)
+        target_cols[target_name] = target_col
+    target_frame = pd.DataFrame(target_data, index=frame.index)
+    target_mask = target_frame.notna().any(axis=1)
+    return target_frame, target_cols, target_mask
+
+
+def _build_temporal_feature_frame(
+    frame: pd.DataFrame,
+    grouped,
+    station_col: str,
+    raw_series_cols: list[str],
+    lags: list[int],
+    windows: list[int],
+    row_mask: pd.Series,
+) -> pd.DataFrame:
+    selected_index = frame.index[row_mask]
+    if not raw_series_cols:
+        return pd.DataFrame(index=selected_index)
+
+    feature_blocks: list[pd.DataFrame] = []
+    total = len(raw_series_cols)
+    for idx, col in enumerate(raw_series_cols, start=1):
+        LOGGER.info("Constructing temporal features for `%s` (%s/%s)", col, idx, total)
+        grouped_col = grouped[col]
+        column_features: dict[str, pd.Series] = {}
+        for lag in lags:
+            column_features[f"{col}_lag_{lag}"] = grouped_col.shift(lag)
+
+        shifted = grouped_col.shift(1)
+        shifted_grouped = shifted.groupby(frame[station_col], sort=False)
+        for window in windows:
+            rolling = shifted_grouped.rolling(window, min_periods=max(1, window // 2))
+            column_features[f"{col}_roll_mean_{window}"] = rolling.mean().reset_index(level=0, drop=True)
+            column_features[f"{col}_roll_std_{window}"] = rolling.std().reset_index(level=0, drop=True)
+
+        feature_blocks.append(pd.DataFrame(column_features, index=frame.index).loc[row_mask])
+
+    return pd.concat(feature_blocks, axis=1) if feature_blocks else pd.DataFrame(index=selected_index)
+
+
+def _build_seasonal_feature_frame(frame: pd.DataFrame, date_col: str, row_mask: pd.Series) -> pd.DataFrame:
+    day_of_year = frame[date_col].dt.dayofyear.astype(float)
+    seasonal = pd.DataFrame(
+        {
+            "doy_sin": np.sin(2.0 * np.pi * day_of_year / 365.25),
+            "doy_cos": np.cos(2.0 * np.pi * day_of_year / 365.25),
+            "month": frame[date_col].dt.month.astype(float),
+        },
+        index=frame.index,
+    )
+    return seasonal.loc[row_mask]
 
 
 def build_model_frame(
@@ -153,23 +282,41 @@ def build_model_frame(
     windows = list(feature_cfg.get("rolling_windows", [7, 30]))
 
     frame, raw_series_cols = _prepare_daily_frame(dynamic_df, config)
-    grouped = frame.groupby(station_col, group_keys=False)
+    LOGGER.info(
+        "Prepared daily frame for horizon=%s: rows=%s stations=%s raw_series=%s",
+        horizon,
+        len(frame),
+        frame[station_col].nunique(),
+        raw_series_cols,
+    )
+    grouped = frame.groupby(station_col, group_keys=False, sort=False)
 
-    # Lag and rolling features are computed on the daily-aligned grid so gaps stay gaps.
-    for col in raw_series_cols:
-        for lag in lags:
-            frame[f"{col}_lag_{lag}"] = grouped[col].shift(lag)
-        shifted = grouped[col].shift(1)
-        for window in windows:
-            rolling = shifted.groupby(frame[station_col]).rolling(window, min_periods=max(1, window // 2))
-            frame[f"{col}_roll_mean_{window}"] = rolling.mean().reset_index(level=0, drop=True)
-            frame[f"{col}_roll_std_{window}"] = rolling.std().reset_index(level=0, drop=True)
+    target_frame, target_cols, target_mask = _build_target_frame(frame, grouped, target_map, horizon)
+    target_row_count = int(target_mask.sum())
+    if target_row_count == 0:
+        raise RuntimeError(f"No target rows remain for horizon={horizon}. Check the target sources or reduce the horizon.")
+    LOGGER.info("Target-eligible rows for horizon=%s: %s", horizon, target_row_count)
+
+    assembled_frames: list[pd.DataFrame] = [frame.loc[target_mask].copy(), target_frame.loc[target_mask]]
+    temporal_feature_frame = _build_temporal_feature_frame(
+        frame=frame,
+        grouped=grouped,
+        station_col=station_col,
+        raw_series_cols=raw_series_cols,
+        lags=lags,
+        windows=windows,
+        row_mask=target_mask,
+    )
+    if not temporal_feature_frame.empty:
+        assembled_frames.append(temporal_feature_frame)
 
     if feature_cfg.get("add_seasonal", True):
-        day_of_year = frame[date_col].dt.dayofyear.astype(float)
-        frame["doy_sin"] = np.sin(2.0 * np.pi * day_of_year / 365.25)
-        frame["doy_cos"] = np.cos(2.0 * np.pi * day_of_year / 365.25)
-        frame["month"] = frame[date_col].dt.month.astype(float)
+        assembled_frames.append(_build_seasonal_feature_frame(frame, date_col, target_mask))
+
+    frame = pd.concat(assembled_frames, axis=1)
+    frame = _maybe_downcast_frame(frame, config, exclude_cols=(station_col, date_col))
+    frame = frame.copy()
+    LOGGER.info("Assembled model-frame core for horizon=%s: rows=%s cols=%s", horizon, len(frame), len(frame.columns))
 
     if static_df is not None:
         static_cols = [station_col] + [col for col in data_cfg.get("static_features", []) if col in static_df.columns]
@@ -188,15 +335,9 @@ def build_model_frame(
             edge_df = pd.DataFrame(columns=["source_station", "neighbor_station", "distance"])
 
         frame = frame.merge(static_merged, on=station_col, how="left")
+        LOGGER.info("Merged static features for horizon=%s: rows=%s cols=%s", horizon, len(frame), len(frame.columns))
     else:
         edge_df = pd.DataFrame(columns=["source_station", "neighbor_station", "distance"])
-
-    target_cols: dict[str, str] = {}
-    for target_name, source_col in target_map.items():
-        target_col = f"target_{target_name}_h{horizon}"
-        # Target shifting also happens on the aligned daily grid so future labels are only available on real observed days.
-        frame[target_col] = grouped[source_col].shift(-horizon)
-        target_cols[target_name] = target_col
 
     feature_cols: list[str] = []
     protected = {station_col, date_col, *target_cols.values()}
@@ -206,16 +347,19 @@ def build_model_frame(
         if frame[col].dtype.kind not in {"f", "i", "u", "b"}:
             continue
         feature_cols.append(col)
+    LOGGER.info("Numeric feature count before filtering for horizon=%s: %s", horizon, len(feature_cols))
 
     non_null_counts = frame[feature_cols].notna().sum(axis=1)
     min_ratio = float(feature_cfg.get("min_non_null_feature_ratio", 0.25))
     min_features = max(1, int(len(feature_cols) * min_ratio))
     frame = frame.loc[non_null_counts >= min_features].copy()
+    LOGGER.info("Rows after non-null feature filtering for horizon=%s: %s", horizon, len(frame))
 
-    # Multi-task rows can keep partial labels; losses and metrics mask target-specific NaNs downstream.
     target_availability = frame[list(target_cols.values())].notna()
     frame = frame.loc[target_availability.any(axis=1)].copy()
+    LOGGER.info("Rows after target-availability filtering for horizon=%s: %s", horizon, len(frame))
 
+    frame = _maybe_downcast_frame(frame, config, exclude_cols=(station_col, date_col))
     frame = frame.reset_index(drop=True)
     return frame, feature_cols, target_cols, edge_df
 
@@ -260,7 +404,6 @@ def build_sequence_samples(
             window_values = window[sequence_feature_cols].to_numpy(dtype=float)
             window_mask = (~np.isnan(window_values)).astype(float)
 
-            # Skip windows that are almost entirely missing; this keeps sequence training stable on sparse stations.
             if float(window_mask.mean()) < min_history_ratio:
                 continue
 

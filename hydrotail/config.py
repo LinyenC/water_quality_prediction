@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
@@ -9,8 +9,8 @@ import yaml
 
 def _resolve_path(base_dir: Path, value: str) -> str:
     path = Path(value)
-    if path.is_absolute():
-        return str(path)
+    if path.is_absolute() or str(value).startswith(("/", "\\")):
+        return str(value)
     return str((base_dir / path).resolve())
 
 
@@ -22,7 +22,16 @@ def load_config(config_path: str | Path) -> dict[str, Any]:
     config = deepcopy(config)
     base_dir = config_path.parent.parent
     config.setdefault("paths", {})
-    for key in ("dynamic_data", "static_data", "output_dir"):
+    for key in (
+        "dynamic_data",
+        "static_data",
+        "output_dir",
+        "dataset_root",
+        "attributes_root",
+        "time_series_root",
+        "wq_root",
+        "cache_dir",
+    ):
         if key in config["paths"]:
             config["paths"][key] = _resolve_path(base_dir, config["paths"][key])
     return config

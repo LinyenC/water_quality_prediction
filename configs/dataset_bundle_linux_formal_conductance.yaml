@@ -1,11 +1,8 @@
 project:
-  name: hydrotail_dataset_bundle
+  name: hydrotail_linux_formal_conductance
 paths:
-  dataset_root: dataset
-  attributes_root: F:\jupyter_notebook\wat_quality_pred\dataset\attritubes
-  time_series_root: F:\jupyter_notebook\baseflow_predict\dataset\time_series
-  wq_root: F:\jupyter_notebook\wat_quality_pred\dataset\WQ
-  output_dir: outputs/dataset_bundle_run
+  dataset_root: /data/data2/linyen3/wat_quality_pred/dataset
+  output_dir: /data/data2/linyen3/wat_quality_pred/outputs/formal_conductance_only_run
 data:
   station_col: station_id
   station_id_width: 8
@@ -14,7 +11,6 @@ data:
   downcast_float32: true
   targets:
     conductance: specific_conductance
-    turbidity: turbidity
   dynamic_features:
   - discharge
   - precip
@@ -102,13 +98,6 @@ data:
         pattern: '*'
         source_value_col: EC
         date_column: Date
-      turbidity:
-        folder_candidates:
-        - Tur
-        - Paired_Tur
-        pattern: '*'
-        source_value_col: Tur
-        date_column: Date
 features:
   horizons:
   - 1
@@ -149,7 +138,6 @@ splits:
 tail:
   exceedance_quantiles:
     conductance: 0.95
-    turbidity: 0.9
   quantiles:
   - 0.1
   - 0.5
@@ -165,19 +153,10 @@ tail:
   tail_weight_multiplier: 4.0
 run:
   models:
-  - linear_tail
-  - gbdt_tail
   - torch_tail
 models:
-  linear_tail:
-    alpha: 0.01
-    max_iter: 2000
-  gbdt_tail:
-    n_estimators: 300
-    max_depth: 3
-    learning_rate: 0.05
-    min_samples_leaf: 20
   torch_tail:
+    device: cuda:0
     graph_backend: neighbor_stats
     hidden_dims:
     - 128
@@ -186,39 +165,6 @@ models:
     batch_size: 256
     epochs: 25
     patience: 5
-    learning_rate: 0.001
-    weight_decay: 0.0001
-    gnn:
-      hidden_dim: 64
-      num_layers: 2
-      dropout: 0.1
-  seq_tcn_tail:
-    graph_backend: neighbor_stats
-    hidden_dim: 64
-    tcn_channels:
-    - 64
-    - 64
-    kernel_size: 3
-    dropout: 0.1
-    batch_size: 128
-    epochs: 20
-    patience: 4
-    learning_rate: 0.001
-    weight_decay: 0.0001
-    gnn:
-      hidden_dim: 64
-      num_layers: 2
-      dropout: 0.1
-  seq_transformer_tail:
-    graph_backend: neighbor_stats
-    hidden_dim: 64
-    num_heads: 4
-    num_layers: 2
-    ff_multiplier: 2
-    dropout: 0.1
-    batch_size: 128
-    epochs: 20
-    patience: 4
     learning_rate: 0.001
     weight_decay: 0.0001
     gnn:
