@@ -94,9 +94,10 @@ data:
 
 features:
   horizons:
-    - 1
+  - 1
+  include_target_history_features: false
   lags:
-    - 1
+  - 1
     - 3
     - 7
   rolling_windows:

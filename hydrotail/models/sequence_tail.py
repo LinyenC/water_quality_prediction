@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +15,8 @@ from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 from hydrotail.data import SequenceSamples
 from hydrotail.models.graph_backends import GraphBackbone, build_neighbor_map
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _resolve_device(device_value: object) -> torch.device:
@@ -620,8 +624,20 @@ class SequenceTailModel:
             torch.tensor(e_valid),
         )
 
-        for _epoch in range(int(self.model_cfg.get("epochs", 20))):
+        total_epochs = int(self.model_cfg.get("epochs", 20))
+        LOGGER.info(
+            "Starting dense sequence-tail training: epochs=%s batch_size=%s train_samples=%s valid_samples=%s",
+            total_epochs,
+            int(self.model_cfg.get("batch_size", 128)),
+            len(train_values),
+            len(valid_values),
+        )
+        for epoch_idx in range(total_epochs):
+            epoch_number = epoch_idx + 1
+            epoch_start = time.perf_counter()
             self.model.train()
+            epoch_train_loss = 0.0
+            epoch_batch_count = 0
             for batch_values, batch_masks, batch_static, batch_targets, batch_events in loader:
                 batch_values = batch_values.to(self.device, non_blocking=pin_memory)
                 batch_masks = batch_masks.to(self.device, non_blocking=pin_memory)
@@ -651,16 +667,30 @@ class SequenceTailModel:
                     total_loss = total_loss + q_loss + event_loss + 0.1 * boundary_loss
                 total_loss.backward()
                 optimizer.step()
+                epoch_train_loss += float(total_loss.detach().cpu())
+                epoch_batch_count += 1
 
             valid_loss = self._dense_validation_loss(valid_tensors, quantiles_tensor, quantile_weight_tensor)
+            average_train_loss = epoch_train_loss / max(epoch_batch_count, 1)
             if valid_loss < best_valid:
                 best_valid = valid_loss
                 best_state = copy.deepcopy(self.model.state_dict())
                 wait = 0
             else:
                 wait += 1
-                if wait >= patience:
-                    break
+            LOGGER.info(
+                "Dense sequence-tail epoch %s/%s: train_loss=%.4f valid_loss=%.4f best_valid=%.4f wait=%s elapsed=%.1fs",
+                epoch_number,
+                total_epochs,
+                average_train_loss,
+                valid_loss,
+                best_valid,
+                wait,
+                time.perf_counter() - epoch_start,
+            )
+            if wait >= patience:
+                LOGGER.info("Dense sequence-tail early stopping at epoch %s/%s", epoch_number, total_epochs)
+                break
 
         self.model.load_state_dict(best_state)
         self.model.eval()
@@ -762,23 +792,48 @@ class SequenceTailModel:
         patience = int(self.model_cfg.get("patience", 5))
         wait = 0
 
-        for _epoch in range(int(self.model_cfg.get("epochs", 20))):
+        total_epochs = int(self.model_cfg.get("epochs", 20))
+        LOGGER.info(
+            "Starting graph sequence-tail training: epochs=%s train_snapshots=%s valid_snapshots=%s",
+            total_epochs,
+            len(train_snapshots),
+            len(valid_snapshots),
+        )
+        for epoch_idx in range(total_epochs):
+            epoch_number = epoch_idx + 1
+            epoch_start = time.perf_counter()
             self.model.train()
+            epoch_train_loss = 0.0
+            epoch_batch_count = 0
             for snapshot in train_snapshots:
                 optimizer.zero_grad()
                 loss = self._graph_snapshot_loss(snapshot, quantiles_tensor, quantile_weight_tensor)
                 loss.backward()
                 optimizer.step()
+                epoch_train_loss += float(loss.detach().cpu())
+                epoch_batch_count += 1
 
             valid_loss = self._graph_validation_loss(valid_snapshots, quantiles_tensor, quantile_weight_tensor)
+            average_train_loss = epoch_train_loss / max(epoch_batch_count, 1)
             if valid_loss < best_valid:
                 best_valid = valid_loss
                 best_state = copy.deepcopy(self.model.state_dict())
                 wait = 0
             else:
                 wait += 1
-                if wait >= patience:
-                    break
+            LOGGER.info(
+                "Graph sequence-tail epoch %s/%s: train_loss=%.4f valid_loss=%.4f best_valid=%.4f wait=%s elapsed=%.1fs",
+                epoch_number,
+                total_epochs,
+                average_train_loss,
+                valid_loss,
+                best_valid,
+                wait,
+                time.perf_counter() - epoch_start,
+            )
+            if wait >= patience:
+                LOGGER.info("Graph sequence-tail early stopping at epoch %s/%s", epoch_number, total_epochs)
+                break
 
         self.model.load_state_dict(best_state)
         self.model.eval()
@@ -893,23 +948,24 @@ class SequenceTailModel:
         if self.graph_backend == "gnn":
             return self._predict_with_gnn_backend(bundle.frame, sequence_values, sequence_masks, static_values)
 
-        with torch.no_grad():
-            outputs = self.model(
-                torch.tensor(sequence_values, device=self.device),
-                torch.tensor(sequence_masks, device=self.device),
-                torch.tensor(static_values, device=self.device),
-            )
-
         predictions = self._empty_predictions(len(bundle.frame))
-        for target_name in self.target_names:
-            quantile_matrix = outputs[target_name]["quantiles"].detach().cpu().numpy()
-            predictions[target_name]["point"] = quantile_matrix[:, self.point_quantile_index]
-            predictions[target_name]["quantiles"] = {
-                quantile: quantile_matrix[:, idx] for idx, quantile in enumerate(self.quantiles)
-            }
-            predictions[target_name]["exceedance_probability"] = (
-                torch.sigmoid(outputs[target_name]["logit"]).detach().cpu().numpy()
-            )
+        batch_size = int(self.model_cfg.get("predict_batch_size", self.model_cfg.get("batch_size", 128)))
+        with torch.no_grad():
+            for start in range(0, len(bundle.frame), batch_size):
+                stop = min(start + batch_size, len(bundle.frame))
+                outputs = self.model(
+                    torch.tensor(sequence_values[start:stop], dtype=torch.float32, device=self.device),
+                    torch.tensor(sequence_masks[start:stop], dtype=torch.float32, device=self.device),
+                    torch.tensor(static_values[start:stop], dtype=torch.float32, device=self.device),
+                )
+                for target_name in self.target_names:
+                    quantile_matrix = outputs[target_name]["quantiles"].detach().cpu().numpy()
+                    predictions[target_name]["point"][start:stop] = quantile_matrix[:, self.point_quantile_index]
+                    for idx, quantile in enumerate(self.quantiles):
+                        predictions[target_name]["quantiles"][quantile][start:stop] = quantile_matrix[:, idx]
+                    predictions[target_name]["exceedance_probability"][start:stop] = (
+                        torch.sigmoid(outputs[target_name]["logit"]).detach().cpu().numpy()
+                    )
         return predictions
 
     def _predict_with_gnn_backend(

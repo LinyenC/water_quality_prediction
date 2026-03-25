@@ -1,18 +1,16 @@
 project:
-  name: hydrotail_linux_turbidity_later_era_pilot
+  name: hydrotail_linux_formal_conductance_retrieval
 paths:
   dataset_root: /data/data2/linyen3/wat_quality_pred/dataset
-  output_dir: /data/data2/linyen3/wat_quality_pred/outputs/turbidity_later_era_pilot_run
+  output_dir: /data/data2/linyen3/wat_quality_pred/outputs/formal_conductance_retrieval_run
 data:
   station_col: station_id
   station_id_width: 8
   date_col: date
   time_frequency: D
   downcast_float32: true
-  date_filter:
-    start_date: 2000-01-01
   targets:
-    turbidity: turbidity
+    conductance: specific_conductance
   dynamic_features:
   - discharge
   - precip
@@ -93,12 +91,12 @@ data:
     - wq
     wq_cache_name: wq_observations.csv
     wq_sources:
-      turbidity:
+      conductance:
         folder_candidates:
-        - Tur
-        - Paired_Tur
+        - SEC
+        - Paired_EC
         pattern: '*'
-        source_value_col: Tur
+        source_value_col: EC
         date_column: Date
 features:
   horizons:
@@ -133,14 +131,14 @@ graph:
 splits:
   strategy: unseen_station_and_future
   seed: 42
-  train_station_fraction: 0.6
-  valid_station_fraction: 0.2
-  test_station_fraction: 0.2
-  train_time_fraction: 0.6
-  valid_time_fraction: 0.2
+  train_station_fraction: 0.7
+  valid_station_fraction: 0.15
+  test_station_fraction: 0.15
+  train_time_fraction: 0.7
+  valid_time_fraction: 0.15
 tail:
   exceedance_quantiles:
-    turbidity: 0.9
+    conductance: 0.95
   quantiles:
   - 0.1
   - 0.5
@@ -156,21 +154,26 @@ tail:
   tail_weight_multiplier: 4.0
 run:
   models:
-  - torch_tail
+  - seq_retrieval_prototype_tail
 models:
-  torch_tail:
+  seq_retrieval_prototype_tail:
     device: cuda:0
-    graph_backend: neighbor_stats
-    hidden_dims:
-    - 128
-    - 64
+    encoder_type: tcn
+    hidden_dim: 128
     dropout: 0.1
     batch_size: 256
+    memory_batch_size: 1024
+    num_workers: 4
+    persistent_workers: true
+    prefetch_factor: 2
+    memory_refresh_interval: 2
     epochs: 25
     patience: 5
     learning_rate: 0.001
     weight_decay: 0.0001
-    gnn:
-      hidden_dim: 64
-      num_layers: 2
-      dropout: 0.1
+    top_k_donors: 16
+    retrieval_temperature: 0.2
+    use_prototypes: true
+    num_prototypes: 8
+    use_graph_restriction: true
+    tail_weight_multiplier: 4.0

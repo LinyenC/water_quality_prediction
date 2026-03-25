@@ -1,0 +1,243 @@
+project:
+  name: hydrotail_linux_formal_conductance_retrieval_ablation
+
+paths:
+  dataset_root: /data/data2/linyen3/wat_quality_pred/dataset
+  output_dir: /data/data2/linyen3/wat_quality_pred/outputs/formal_conductance_retrieval_ablation_run
+
+data:
+  station_col: station_id
+  station_id_width: 8
+  date_col: date
+  time_frequency: D
+  downcast_float32: true
+  targets:
+    conductance: specific_conductance
+  dynamic_features:
+    - discharge
+    - precip
+    - tmin
+    - tmax
+    - pe
+  static_features:
+    - latitude
+    - longitude
+    - watershed_area
+    - DEMmean
+    - DROPmean
+    - DEMstd
+    - permeability
+    - porosity
+    - ksat
+    - prcp_yearly_mean
+    - PE_yearly_mean
+    - Qmean
+    - population
+    - agBiomass
+    - Q50
+    - Qstd
+    - Q10
+    - P50
+    - P95
+    - PEstd
+    - iaFmean
+    - IWUmean
+    - IWU_SI
+    - RS_mean
+    - RS_std
+    - PSW_SW_mean
+    - PSW_SW_si
+    - PSW_GW_mean
+    - PSW_GW_si
+    - Wsat
+    - WPnt
+    - vf_clay_s
+  dataset_bundle:
+    use_parquet_cache: true
+    refresh_cache: false
+    drop_all_null_target_rows: true
+    station_selection_strategy: coverage_aware
+    attributes_dir_candidates:
+      - attritubes
+      - attributes
+    attributes_patterns:
+      - "*.xlsx"
+      - "*.csv"
+    attributes_station_col: gauge_id
+    attributes_rename_map:
+      gauge_id: station_id
+      Lat: latitude
+      Lon: longitude
+      Area: watershed_area
+      Ksat: ksat
+    time_series_dir_candidates:
+      - time series
+      - time_series
+    time_series_sources:
+      - folder: streamflow
+        pattern: "*_streamflow.csv"
+        rename_map:
+          Qobs(m3/s): discharge
+      - folder: daymet
+        pattern: "*_forcing.csv"
+        rename_map:
+          Prec: precip
+          Tmin: tmin
+          Tmax: tmax
+      - folder: PE
+        pattern: "*_forcing.csv"
+        rename_map:
+          PE: pe
+    wq_dir_candidates:
+      - WQ
+      - wq
+    wq_cache_name: wq_observations.csv
+    wq_sources:
+      conductance:
+        folder_candidates:
+          - SEC
+          - Paired_EC
+        pattern: "*"
+        source_value_col: EC
+        date_column: Date
+
+features:
+  horizons:
+    - 1
+  include_target_history_features: false
+  lags:
+    - 1
+    - 3
+    - 7
+    - 14
+    - 30
+  rolling_windows:
+    - 3
+    - 7
+    - 14
+    - 30
+  add_seasonal: true
+  min_non_null_feature_ratio: 0.25
+
+sequence:
+  lookback_window: 30
+  min_history_ratio: 0.15
+
+graph:
+  enabled: true
+  k_neighbors: 5
+  feature_columns:
+    - watershed_area
+    - DEMmean
+    - DROPmean
+    - ksat
+    - prcp_yearly_mean
+    - Qmean
+
+splits:
+  strategy: unseen_station_and_future
+  seed: 42
+  train_station_fraction: 0.7
+  valid_station_fraction: 0.15
+  test_station_fraction: 0.15
+  train_time_fraction: 0.7
+  valid_time_fraction: 0.15
+
+tail:
+  exceedance_quantiles:
+    conductance: 0.95
+  quantiles:
+    - 0.1
+    - 0.5
+    - 0.9
+    - 0.95
+    - 0.99
+  quantile_weights:
+    - 1.0
+    - 1.0
+    - 1.5
+    - 2.0
+    - 2.5
+  tail_weight_multiplier: 4.0
+
+run:
+  models:
+    - seq_tcn_tail
+    - seq_retrieval_prototype_tail
+    - seq_retrieval_prototype_tail_nograph
+    - seq_retrieval_prototype_tail_noproto
+
+models:
+  seq_tcn_tail:
+    device: cuda:0
+    graph_backend: neighbor_stats
+    hidden_dim: 128
+    dropout: 0.1
+    batch_size: 256
+    epochs: 25
+    patience: 5
+    learning_rate: 0.001
+    weight_decay: 0.0001
+  seq_retrieval_prototype_tail:
+    device: cuda:0
+    encoder_type: tcn
+    hidden_dim: 128
+    dropout: 0.1
+    batch_size: 256
+    memory_batch_size: 1024
+    num_workers: 4
+    persistent_workers: true
+    prefetch_factor: 2
+    memory_refresh_interval: 2
+    epochs: 25
+    patience: 5
+    learning_rate: 0.001
+    weight_decay: 0.0001
+    top_k_donors: 16
+    retrieval_temperature: 0.2
+    use_prototypes: true
+    num_prototypes: 8
+    use_graph_restriction: true
+    tail_weight_multiplier: 4.0
+  seq_retrieval_prototype_tail_nograph:
+    device: cuda:0
+    encoder_type: tcn
+    hidden_dim: 128
+    dropout: 0.1
+    batch_size: 256
+    memory_batch_size: 1024
+    num_workers: 4
+    persistent_workers: true
+    prefetch_factor: 2
+    memory_refresh_interval: 2
+    epochs: 25
+    patience: 5
+    learning_rate: 0.001
+    weight_decay: 0.0001
+    top_k_donors: 16
+    retrieval_temperature: 0.2
+    use_prototypes: true
+    num_prototypes: 8
+    use_graph_restriction: false
+    tail_weight_multiplier: 4.0
+  seq_retrieval_prototype_tail_noproto:
+    device: cuda:0
+    encoder_type: tcn
+    hidden_dim: 128
+    dropout: 0.1
+    batch_size: 256
+    memory_batch_size: 1024
+    num_workers: 4
+    persistent_workers: true
+    prefetch_factor: 2
+    memory_refresh_interval: 2
+    epochs: 25
+    patience: 5
+    learning_rate: 0.001
+    weight_decay: 0.0001
+    top_k_donors: 16
+    retrieval_temperature: 0.2
+    use_prototypes: false
+    num_prototypes: 0
+    use_graph_restriction: true
+    tail_weight_multiplier: 4.0

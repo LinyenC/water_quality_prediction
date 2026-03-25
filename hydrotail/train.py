@@ -13,12 +13,18 @@ import pandas as pd
 from hydrotail.config import load_config
 from hydrotail.data import SequenceSamples, build_model_frame, build_sequence_samples, load_datasets
 from hydrotail.metrics import classification_metrics, evaluate_tail_subset, quantile_metrics, regression_metrics
-from hydrotail.models import GBDTTailModel, LinearTailModel, SequenceTailModel, TorchTailModel
+from hydrotail.models import GBDTTailModel, LinearTailModel, RetrievalPrototypeTailModel, SequenceTailModel, TorchTailModel
 from hydrotail.splits import assign_splits
 
 
 LOGGER = logging.getLogger(__name__)
-SEQUENCE_MODEL_NAMES = {"seq_tcn_tail", "seq_transformer_tail"}
+SEQUENCE_MODEL_NAMES = {
+    "seq_tcn_tail",
+    "seq_transformer_tail",
+    "seq_retrieval_prototype_tail",
+    "seq_retrieval_prototype_tail_nograph",
+    "seq_retrieval_prototype_tail_noproto",
+}
 ANALYSIS_GROUP_NAMES = [
     "train_station_early",
     "train_station_late",
@@ -106,6 +112,20 @@ def _instantiate_model(model_name: str, config: dict[str, object], quantiles: li
             model_cfg=full_cfg,
             random_state=seed,
         )
+    if model_name in {
+        "seq_retrieval_prototype_tail",
+        "seq_retrieval_prototype_tail_nograph",
+        "seq_retrieval_prototype_tail_noproto",
+    }:
+        full_cfg = dict(model_cfg)
+        full_cfg["tail_weight_multiplier"] = float(config["tail"].get("tail_weight_multiplier", 4.0))
+        return RetrievalPrototypeTailModel(
+            lookback_window=int(config.get("sequence", {}).get("lookback_window", 30)),
+            quantiles=quantiles,
+            quantile_weights=quantile_weights,
+            model_cfg=full_cfg,
+            random_state=seed,
+        )
     raise ValueError(f"Unknown model: {model_name}")
 
 
@@ -122,6 +142,9 @@ def _empty_target_metrics(quantiles: list[float]) -> dict[str, float]:
         "recall": float("nan"),
         "auc": float("nan"),
         "tail_count": 0,
+        "tail_mae": float("nan"),
+        "tail_rmse": float("nan"),
+        "tail_r2": float("nan"),
     }
     for quantile in quantiles:
         metrics[f"pinball_q{quantile}"] = float("nan")
@@ -159,7 +182,10 @@ def _evaluate_predictions(
             target_metrics.update(regression_metrics(y_true[point_mask], point_all[point_mask]))
             if np.isfinite(threshold):
                 tail_metrics = evaluate_tail_subset(y_true[point_mask], point_all[point_mask], threshold)
+                target_metrics["tail_count"] = int(tail_metrics.get("tail_count", 0))
                 for key, value in tail_metrics.items():
+                    if key == "tail_count":
+                        continue
                     target_metrics[f"tail_{key}"] = value
 
         quantile_mask = valid_mask.copy()

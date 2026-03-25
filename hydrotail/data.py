@@ -76,6 +76,11 @@ def _downcast_enabled(config: dict[str, object]) -> bool:
     return bool(data_cfg.get("downcast_float32", bundle_cfg.get("downcast_float32", True)))
 
 
+def _include_target_history_features(config: dict[str, object]) -> bool:
+    feature_cfg = config.get("features", {})
+    return bool(feature_cfg.get("include_target_history_features", False))
+
+
 def _maybe_downcast_frame(
     frame: pd.DataFrame,
     config: dict[str, object],
@@ -188,7 +193,11 @@ def _prepare_daily_frame(dynamic_df: pd.DataFrame, config: dict[str, object]) ->
     date_col = data_cfg["date_col"]
     target_map = data_cfg["targets"]
     dynamic_feature_cols = [col for col in data_cfg.get("dynamic_features", []) if col in dynamic_df.columns]
-    raw_series_cols = list(dict.fromkeys(dynamic_feature_cols + list(target_map.values())))
+    target_source_cols = [col for col in dict.fromkeys(target_map.values()) if col in dynamic_df.columns]
+    if _include_target_history_features(config):
+        raw_series_cols = list(dict.fromkeys(dynamic_feature_cols + target_source_cols))
+    else:
+        raw_series_cols = dynamic_feature_cols
 
     frame = dynamic_df.copy()
     frame[date_col] = pd.to_datetime(frame[date_col])
@@ -198,7 +207,10 @@ def _prepare_daily_frame(dynamic_df: pd.DataFrame, config: dict[str, object]) ->
 
     for col in raw_series_cols:
         frame[f"{col}_observed"] = frame[col].notna().astype(float)
-    frame["any_dynamic_observed"] = frame[raw_series_cols].notna().any(axis=1).astype(float)
+    if raw_series_cols:
+        frame["any_dynamic_observed"] = frame[raw_series_cols].notna().any(axis=1).astype(float)
+    else:
+        frame["any_dynamic_observed"] = 0.0
     frame = _maybe_downcast_frame(frame, config, exclude_cols=(station_col, date_col))
     return frame, raw_series_cols
 
@@ -297,7 +309,19 @@ def build_model_frame(
         raise RuntimeError(f"No target rows remain for horizon={horizon}. Check the target sources or reduce the horizon.")
     LOGGER.info("Target-eligible rows for horizon=%s: %s", horizon, target_row_count)
 
-    assembled_frames: list[pd.DataFrame] = [frame.loc[target_mask].copy(), target_frame.loc[target_mask]]
+    base_feature_cols: list[str] = [station_col, date_col]
+    for col in raw_series_cols:
+        if col in frame.columns:
+            base_feature_cols.append(col)
+        observed_col = f"{col}_observed"
+        if observed_col in frame.columns:
+            base_feature_cols.append(observed_col)
+    for aux_col in ("is_original_observation", "is_gap_filled", "any_dynamic_observed"):
+        if aux_col in frame.columns:
+            base_feature_cols.append(aux_col)
+    base_feature_cols = list(dict.fromkeys(base_feature_cols))
+
+    assembled_frames: list[pd.DataFrame] = [frame.loc[target_mask, base_feature_cols].copy(), target_frame.loc[target_mask]]
     temporal_feature_frame = _build_temporal_feature_frame(
         frame=frame,
         grouped=grouped,
@@ -374,13 +398,15 @@ def build_sequence_samples(
     data_cfg = config["data"]
     station_col = data_cfg["station_col"]
     date_col = data_cfg["date_col"]
-    target_source_cols = list(data_cfg["targets"].values())
     dynamic_feature_cols = [col for col in data_cfg.get("dynamic_features", []) if col in frame.columns]
     sequence_cfg = config.get("sequence", {})
     lookback_window = int(sequence_cfg.get("lookback_window", 30))
     min_history_ratio = float(sequence_cfg.get("min_history_ratio", 0.15))
 
-    sequence_feature_cols = list(dict.fromkeys(dynamic_feature_cols + target_source_cols))
+    sequence_feature_cols = list(dynamic_feature_cols)
+    if _include_target_history_features(config):
+        target_source_cols = [col for col in dict.fromkeys(data_cfg["targets"].values()) if col in frame.columns]
+        sequence_feature_cols = list(dict.fromkeys(sequence_feature_cols + target_source_cols))
     if "is_gap_filled" in frame.columns:
         sequence_feature_cols.append("is_gap_filled")
     for seasonal_col in ("doy_sin", "doy_cos", "month"):

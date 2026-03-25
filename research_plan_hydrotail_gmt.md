@@ -228,9 +228,8 @@ Optional experiment:
 
 ## Baselines
 
-Recommended baseline groups:
+Recommended baseline groups for the strict ungauged main study:
 
-- `Persistence`
 - `Linear Regression` / `Elastic Net`
 - `LightGBM` / `XGBoost`
 - `LSTM`
@@ -247,7 +246,6 @@ Current codebase status:
   - `seq_tcn_tail`
   - `seq_transformer_tail`
 - not yet implemented as dedicated baselines in the current repo:
-  - `Persistence`
   - `LSTM`
   - `TFT`
   - `LightGBM` / `XGBoost` as separate named routes
@@ -449,6 +447,24 @@ Current observed server status after the update:
    - next-observed-value prediction
 4. after the split definition is fixed, compare `torch_tail` across `none | neighbor_stats | gnn`
 5. only then expand the real-data sequence experiments to `seq_tcn_tail` and `seq_transformer_tail`
+
+## Paper-facing scope decision (2026-03-24)
+
+The manuscript-facing study is now explicitly restricted to the strict ungauged setting.
+
+This means:
+
+- no target-basin `specific_conductance` history should enter the main model inputs
+- the conductance main line should use `features.include_target_history_features: false`
+- history-aware conductance runs can exist as internal diagnostics, but should not appear in the paper's main reported results
+- `naive_last_conductance` should also be treated as internal diagnostic analysis rather than a reported manuscript baseline for the ungauged paper line
+
+The paper-facing conductance story should therefore be framed as:
+
+- conductance-only
+- no target-history features
+- unseen-station and future-period generalization
+- tail-aware and probabilistic evaluation under strict ungauged assumptions
 
 ## Static attribute set update (2026-03-23)
 

@@ -25,6 +25,7 @@ Build a complete data-audit workflow for the HydroTail project so we can quantif
 - Use the server-side full-data cache as the primary audit substrate for the first analysis round.
 - Reuse the completed formal prediction files for split-aware audit instead of regenerating the model frame.
 - Recommend a conductance-first main line and a separate turbidity redesign line instead of keeping the current joint formal setup.
+- Fix the paper-facing conductance line to the strict ungauged setting: no target-history inputs and no naive/history-aware result line in the manuscript.
 
 ## Errors Encountered
 - Remote audit script initially failed because `hydrotail` was not on PYTHONPATH: reran with `PYTHONPATH=.`.

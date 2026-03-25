@@ -101,6 +101,7 @@ Sequence options:
 
 - `seq_tcn_tail`
 - `seq_transformer_tail`
+- `seq_retrieval_prototype_tail`
 
 ## 6. Graph backend options
 
@@ -407,3 +408,81 @@ Two new Linux configs were added:
   - no `lai/swe`
   - date filter starts at `2000-01-01`
   - uses a later-era split to avoid the previous turbidity train-collapse
+
+
+## 17. Target-history feature removal and tail metric fix (2026-03-24)
+
+Two follow-up changes were made after inspecting the first `conductance-only` formal run:
+
+- bundle-based experiment configs now set `features.include_target_history_features: false`
+- target source columns such as `specific_conductance` and `turbidity` are now used to create future labels, but are no longer automatically included as raw inputs, observed flags, lag features, or rolling features unless a config explicitly turns target-history features back on
+
+This makes the default conductance workflow better aligned with the intended deployment setting where no in-situ conductance measurements are available for the prediction basin.
+
+In addition, the tail-metric output bug has been fixed:
+
+- the metrics writer previously stored the true tail count under `tail_tail_count` while leaving the placeholder `tail_count = 0`
+- it now writes the actual count to `tail_count` and keeps `tail_mae`, `tail_rmse`, and `tail_r2` under stable names
+
+## 18. Paper-facing scope decision (2026-03-24)
+
+The paper-facing research line is now fixed to the strict ungauged setting.
+
+This means:
+
+- the main study does **not** use target-basin `specific_conductance` history as model input
+- the active conductance manuscript line should use configs with:
+  - `features.include_target_history_features: false`
+- the main paper should not report the `naive_last_conductance` comparison tables
+- the main paper should not use the `conductance-with-history` multihorizon run as a reported result line
+
+Current recommended paper-facing config:
+
+- `configs/dataset_bundle_linux_formal_conductance.yaml`
+  - conductance-only
+  - strict ungauged input setting
+  - no `lai/swe`
+  - no target-history features
+
+Internal-use-only diagnostic artifacts may still remain in `plan/` or `configs/`, but they should be treated as method-diagnosis material rather than manuscript evidence.
+
+## 19. Retrieval-prototype sequence model (2026-03-24)
+
+The codebase now also includes a new sequence route:
+
+- `seq_retrieval_prototype_tail`
+
+This is the first implementable `v1` of the strict-ungauged donor-transfer idea.
+
+Current design:
+
+- local TCN or Transformer event encoder
+- station-level donor-memory retrieval from source basins
+- learnable prototype tokens
+- per-epoch training logs (`epoch/train_loss/valid_loss/wait`)
+- cached donor candidates plus interval-based memory-bank refresh in the current optimized `v1`
+- gated fusion of:
+  - local representation
+  - donor representation
+  - prototype representation
+- existing quantile and exceedance heads
+
+Recommended Linux config for this route:
+
+- `configs/dataset_bundle_linux_formal_conductance_retrieval.yaml`
+
+Recommended ablation bundle for fair comparison against the sequence baseline:
+
+- `configs/dataset_bundle_linux_formal_conductance_retrieval_ablation.yaml`
+- shared preprocessing / shared sequence-sample construction
+- models:
+  - `seq_tcn_tail`
+  - `seq_retrieval_prototype_tail`
+  - `seq_retrieval_prototype_tail_nograph`
+  - `seq_retrieval_prototype_tail_noproto`
+
+Current intended use:
+
+- conductance-only
+- `features.include_target_history_features: false`
+- strict ungauged manuscript line

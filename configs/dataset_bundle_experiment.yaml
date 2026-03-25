@@ -112,6 +112,7 @@ data:
 features:
   horizons:
   - 1
+  include_target_history_features: false
   lags:
   - 1
   - 3

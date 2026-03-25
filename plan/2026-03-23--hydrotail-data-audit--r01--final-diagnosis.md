@@ -152,8 +152,8 @@ After the audit, the more accurate belief is:
 ## Recommended Research Strategy
 I recommend splitting the project into a stable main line and a separate sparse-target line.
 
-### Recommended main line: conductance-first
-Use conductance as the main paper-quality task for the next formal round.
+### Recommended main line: strict-ungauged conductance-first
+Use conductance as the main paper-quality task for the next formal round, but keep the deployment assumption strict: no target-basin conductance history in the model inputs.
 
 Why:
 - it has broad station support
@@ -166,6 +166,7 @@ Recommended conductance-first configuration:
 - keep `unseen_station_and_future` if the paper goal is true spatial-temporal generalization
 - if the split still starts before 2000, remove `lai` and `swe` from the main conductance feature set
 - keep the dynamic families that are actually available in the train era: `discharge`, `precip`, `tmin`, `tmax`, `pe`
+- do not make history-aware conductance or naive persistence runs part of the manuscript-facing evidence line
 
 This is the most stable path to a defensible main result.
 

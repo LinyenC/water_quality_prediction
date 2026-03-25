@@ -1,18 +1,18 @@
+# Internal diagnostic config only.
+# Exclude this setting from the paper-facing strict-ungauged study because it uses target-basin conductance history as input.
 project:
-  name: hydrotail_linux_turbidity_later_era_pilot
+  name: hydrotail_linux_formal_conductance_with_history_multihorizon
 paths:
   dataset_root: /data/data2/linyen3/wat_quality_pred/dataset
-  output_dir: /data/data2/linyen3/wat_quality_pred/outputs/turbidity_later_era_pilot_run
+  output_dir: /data/data2/linyen3/wat_quality_pred/outputs/formal_conductance_with_history_multihorizon_run
 data:
   station_col: station_id
   station_id_width: 8
   date_col: date
   time_frequency: D
   downcast_float32: true
-  date_filter:
-    start_date: 2000-01-01
   targets:
-    turbidity: turbidity
+    conductance: specific_conductance
   dynamic_features:
   - discharge
   - precip
@@ -93,17 +93,22 @@ data:
     - wq
     wq_cache_name: wq_observations.csv
     wq_sources:
-      turbidity:
+      conductance:
         folder_candidates:
-        - Tur
-        - Paired_Tur
+        - SEC
+        - Paired_EC
         pattern: '*'
-        source_value_col: Tur
+        source_value_col: EC
         date_column: Date
 features:
   horizons:
-  - 1
-  include_target_history_features: false
+  - 2
+  - 3
+  - 7
+  - 10
+  - 14
+  - 30
+  include_target_history_features: true
   lags:
   - 1
   - 3
@@ -133,14 +138,14 @@ graph:
 splits:
   strategy: unseen_station_and_future
   seed: 42
-  train_station_fraction: 0.6
-  valid_station_fraction: 0.2
-  test_station_fraction: 0.2
-  train_time_fraction: 0.6
-  valid_time_fraction: 0.2
+  train_station_fraction: 0.7
+  valid_station_fraction: 0.15
+  test_station_fraction: 0.15
+  train_time_fraction: 0.7
+  valid_time_fraction: 0.15
 tail:
   exceedance_quantiles:
-    turbidity: 0.9
+    conductance: 0.95
   quantiles:
   - 0.1
   - 0.5
